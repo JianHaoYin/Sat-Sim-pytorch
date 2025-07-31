@@ -66,11 +66,11 @@ def HillPointTestFunction(celMsgSet):
 
 
     state_dict, (sigma_RN, omega_RN_N, dot_omega_RN_N) = module.forward(
-        None,
+
         r_BN_N=r_BN_N,
         v_BN_N=v_BN_N,
-        r_celestialObject_N=planetPos,
-        v_celestialObject_N=planetVel,
+        r_celestialObjectN_N=planetPos,
+        v_celestialObjectN_N=planetVel,
     )
 
     return state_dict, (sigma_RN, omega_RN_N, dot_omega_RN_N)

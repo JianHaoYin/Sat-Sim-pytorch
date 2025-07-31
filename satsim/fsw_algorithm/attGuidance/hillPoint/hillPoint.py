@@ -18,44 +18,40 @@ class HillPoint(Module[HillPointStateDict]):
         '''
         super().__init__(*args, **kwargs)
 
-
-    def reset(self) -> HillPointStateDict | None:
-        pass
     
-
     def forward(
         self,
+        r_BN_N: torch.Tensor,
+        v_BN_N: torch.Tensor,
         state_dict: HillPointStateDict | None = None,
-        r_BN_N: torch.Tensor | None = None,
-        v_BN_N: torch.Tensor | None = None,
-        r_celestialObject_N: torch.Tensor | None = None,
-        v_celestialObject_N: torch.Tensor | None = None,
+        r_celestialObjectN_N: torch.Tensor | None = None,
+        v_celestialObjectN_N: torch.Tensor | None = None,
         *args,
         **kwargs,
-    ) -> tuple[HillPointStateDict | None]:
+    ) -> tuple[HillPointStateDict, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         '''This is the main method that gets called every time the module is updated.
             Args:
                 state_dict (HillPointStateDict | None): The state dictionary of the module.
-                r_BN_N: torch.Tensor | None = None: The position vector of the spacecraft in the inertial frame.
-                v_BN_N: torch.Tensor | None = None: The velocity vector of the spacecraft in the inertial frame.
-                r_celestialObject_N: torch.Tensor | None = None: The position vector of the celestial object in the inertial frame.
-                v_celestialObject_N: torch.Tensor | None = None: The velocity vector of the celestial object in the inertial frame.
+                r_BN_N: torch.Tensor: The position vector of the spacecraft in the inertial frame.
+                v_BN_N: torch.Tensor: The velocity vector of the spacecraft in the inertial frame.
+                r_celestialObjectN_N: torch.Tensor | None = None: The position vector of the celestial object in the inertial frame.
+                v_celestialObjectN_N: torch.Tensor | None = None: The velocity vector of the celestial object in the inertial frame.
         '''
 
-        if r_celestialObject_N is None:
-            r_celestialObject_N = torch.tensor([0., 0., 0.], device=r_BN_N.device)
-        if v_celestialObject_N is None:
-            v_celestialObject_N = torch.tensor([0., 0., 0.], device=v_BN_N.device)
+        if r_celestialObjectN_N is None:
+            r_celestialObjectN_N = torch.tensor([0., 0., 0.], device=r_BN_N.device)
+        if v_celestialObjectN_N is None:
+            v_celestialObjectN_N = torch.tensor([0., 0., 0.], device=v_BN_N.device)
         
-        rel_position_vector = r_BN_N - r_celestialObject_N
-        rel_velocity_vector = v_BN_N - v_celestialObject_N
+        rel_position_vector = r_BN_N - r_celestialObjectN_N
+        rel_velocity_vector = v_BN_N - v_celestialObjectN_N
 
-        rel_position_vector_magnitude = torch.linalg.norm(rel_position_vector, dim=-1)
+        rel_position_vector_magnitude = torch.norm(rel_position_vector, dim=-1)
 
         dcm_RN_0 = rel_position_vector / rel_position_vector_magnitude.unsqueeze(-1)
 
         h = torch.cross(rel_position_vector, rel_velocity_vector, dim=-1)
-        h_magnitude = torch.linalg.norm(h, dim=-1)
+        h_magnitude = torch.norm(h, dim=-1)
         dcm_RN_2 = h/h_magnitude.unsqueeze(-1)
         dcm_RN_1 = torch.cross(dcm_RN_2, dcm_RN_0, dim=-1)
 
@@ -63,16 +59,39 @@ class HillPoint(Module[HillPointStateDict]):
 
         sigma_RN = _DCM_to_MRP(dcm_RN)
 
-        r_magnitude = torch.linalg.norm(rel_position_vector, dim=-1)
+        r_magnitude = torch.norm(rel_position_vector, dim=-1)
 
 
-        if r_magnitude > 1.:
-            dot_f_dot_t = h_magnitude / (r_magnitude**2)
-            ddot_f_dot_t2 = -2.0 * (rel_velocity_vector*dcm_RN_0).sum(dim=-1) / r_magnitude * dot_f_dot_t
-        else:
-            ref_shape = rel_position_vector.shape  # (batch, number, 3)
-            dot_f_dot_t = torch.zeros(ref_shape[:-1] + (1,), device=rel_position_vector.device, dtype=rel_position_vector.dtype)
-            ddot_f_dot_t2 = torch.zeros_like(dot_f_dot_t)
+        # if r_magnitude > 1.:
+        #     dot_f_dot_t = h_magnitude / (r_magnitude**2)
+        #     ddot_f_dot_t2 = -2.0 * (rel_velocity_vector*dcm_RN_0).sum(dim=-1) / r_magnitude * dot_f_dot_t
+        # else:
+        #     ref_shape = rel_position_vector.shape
+        #     dot_f_dot_t = torch.zeros(ref_shape[:-1] + (1,), device=rel_position_vector.device, dtype=rel_position_vector.dtype)
+        #     ddot_f_dot_t2 = torch.zeros_like(dot_f_dot_t)
+            
+        
+        # find the shape of the rel_position_vector
+        ref_shape = rel_position_vector.shape  # e.g., [batch_size, 3]
+        batch_shape = ref_shape[:-1]           # e.g., [batch_size]
+
+        # Create a mask to identify elements where the magnitude of the relative position vector is greater than 1.0
+        mask = r_magnitude > 1.0
+
+        # Calculate the value of dot_f_dot_t and ddot_f_dot_t2 for all elements (without considering the if)
+        dot_f_dot_t_all = h_magnitude / (r_magnitude ** 2)
+
+        # Broadcast processing of rel_velocity_vector * dcm_RN_0
+        rel_velocity_proj = (rel_velocity_vector * dcm_RN_0).sum(dim=-1)  # shape: [...], 与 r_magnitude 一致
+        ddot_f_dot_t2_all = -2.0 * rel_velocity_proj / r_magnitude * dot_f_dot_t_all
+
+        # Construct a zero tensor (value used for else branch)
+        zeros = torch.zeros(batch_shape + (1,), device=rel_position_vector.device, dtype=rel_position_vector.dtype)
+
+        # Use torch.where to select results element by element (and keep the last dimension)
+        dot_f_dot_t = torch.where(mask.unsqueeze(-1), dot_f_dot_t_all.unsqueeze(-1), zeros)
+        ddot_f_dot_t2 = torch.where(mask.unsqueeze(-1), ddot_f_dot_t2_all.unsqueeze(-1), zeros)
+
 
 
         omega_RN_R_2 = dot_f_dot_t
@@ -92,22 +111,22 @@ class HillPoint(Module[HillPointStateDict]):
         dot_omega_RN_N = torch.matmul(dcm_NR, omega_dot_RN_R.unsqueeze(-1)).squeeze(-1)
         
 
-        return state_dict, (sigma_RN, omega_RN_N, dot_omega_RN_N)
+        return HillPointStateDict(), (sigma_RN, omega_RN_N, dot_omega_RN_N)
 
 
 
 
 def _DCM_to_MRP(dcm: torch.Tensor) -> torch.Tensor:
     """
-    Convert a direction cosine matrix to a MRP vector. 支持批量输入。
-    输入:
+    Convert a direction cosine matrix to a MRP vector. 
+    Input:
         dcm: shape (..., 3, 3)
-    输出:
+    Output:
         mrp: shape (..., 3)
     """
-    # 先转四元数（Euler Parameters），保证第一个分量非负
+
     b = _DCM_to_EulerParameters(dcm)  # (..., 4)
-    # 防止分母为零
+
     mrp_0 = b[..., 1]/(1+b[..., 0])
     mrp_1 = b[..., 2]/(1+b[..., 0])
     mrp_2 = b[..., 3]/(1+b[..., 0])
@@ -118,14 +137,14 @@ def _DCM_to_MRP(dcm: torch.Tensor) -> torch.Tensor:
 
 def _DCM_to_EulerParameters(C: torch.Tensor) -> torch.Tensor:
     """
-    支持批量的DCM转四元数（Euler Parameters），第一个分量非负。
-    输入:
+    Convert a direction cosine matrix (DCM) to Euler Parameters (quaternion) with batched support.
+    Ensures the first component is non-negative.
+    Input:
         C: shape (..., 3, 3)
-    输出:
+    Output:
         b: shape (..., 4)
     """
     tr = C[..., 0, 0] + C[..., 1, 1] + C[..., 2, 2]
-
 
     b2_0 = (1 + tr) / 4.
     b2_1 = (1 + 2 * C[..., 0, 0] - tr) / 4.
@@ -133,13 +152,12 @@ def _DCM_to_EulerParameters(C: torch.Tensor) -> torch.Tensor:
     b2_3 = (1 + 2 * C[..., 2, 2] - tr) / 4.
     b2 = torch.stack([b2_0, b2_1, b2_2, b2_3], dim=-1)
 
-    # 找到最大分量的索引
+    # Find the index of the maximum component
     i = torch.argmax(b2, dim=-1)
 
 
     # case 0
     if i == 0:
-        # 分别计算b_0, b_1, b_2, b_3，然后stack
         b_0 = torch.sqrt(b2[..., 0])
         b_1 = (C[..., 1, 2] - C[..., 2, 1]) / (4 * b_0)
         b_2 = (C[..., 2, 0] - C[..., 0, 2]) / (4 * b_0)
@@ -179,6 +197,9 @@ def _DCM_to_EulerParameters(C: torch.Tensor) -> torch.Tensor:
         b_2 = (C[..., 1, 2] + C[..., 2, 1]) / (4 * b_3)
         b = torch.stack([b_0, b_1, b_2, b_3], dim=-1)
         return b
+    
+    else:
+        raise ValueError("Invalid index for case")
 
 
 

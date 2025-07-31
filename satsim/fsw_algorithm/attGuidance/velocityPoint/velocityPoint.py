@@ -8,13 +8,10 @@ from satsim.utils.matrix_support import to_rotation_matrix
 class VelocityPointStateDict(TypedDict):
     pass
 
+
 class VelocityPoint(Module[VelocityPointStateDict]):
 
-    def __init__(
-            self,
-            mu: torch.Tensor | None = None,
-            *args,
-            **kwargs):
+    def __init__(self, mu: torch.Tensor | None = None, *args, **kwargs):
         '''This module generate the attitude reference to perform a constant pointing towards a Velocity orbit axis.
 
         Args:
@@ -22,10 +19,10 @@ class VelocityPoint(Module[VelocityPointStateDict]):
 
         '''
         super().__init__(*args, **kwargs)
+
         MU_EARTH = 398600.436
-        mu = torch.tensor(
-            [MU_EARTH*1e9], dtype=torch.float32
-        ) if mu is None else mu
+        mu = torch.tensor([MU_EARTH *
+                           1e9], dtype=torch.float32) if mu is None else mu
 
         self.register_buffer(
             "mu",
@@ -33,105 +30,112 @@ class VelocityPoint(Module[VelocityPointStateDict]):
             persistent=False,
         )
 
-
-    def reset(self) -> VelocityPointStateDict | None:
-        pass
-    
-
     def forward(
         self,
+        r_BN_N: torch.Tensor,
+        v_BN_N: torch.Tensor,
         state_dict: VelocityPointStateDict | None = None,
-        r_BN_N: torch.Tensor | None = None,
-        v_BN_N: torch.Tensor | None = None,
-        r_celestialObject_N: torch.Tensor | None = None,
-        v_celestialObject_N: torch.Tensor | None = None,
+        r_celestialObjectN_N: torch.Tensor | None = None,
+        v_celestialObjectN_N: torch.Tensor | None = None,
         *args,
         **kwargs,
-    ) -> tuple[VelocityPointStateDict | None]:
+    ) -> tuple[VelocityPointStateDict, tuple[torch.Tensor, torch.Tensor,
+                                             torch.Tensor]]:
         '''This is the main method that gets called every time the module is updated.
             Args:
                 state_dict (VelocityPointStateDict | None): The state dictionary of the module.
                 r_BN_N: torch.Tensor | None = None: The position vector of the spacecraft in the inertial frame.
                 v_BN_N: torch.Tensor | None = None: The velocity vector of the spacecraft in the inertial frame.
-                r_celestialObject_N: torch.Tensor | None = None: The position vector of the celestial object in the inertial frame.
-                v_celestialObject_N: torch.Tensor | None = None: The velocity vector of the celestial object in the inertial frame.
+                r_celestialObjectN_N: torch.Tensor | None = None: The position vector of the celestial object in the inertial frame.
+                v_celestialObjectN_N: torch.Tensor | None = None: The velocity vector of the celestial object in the inertial frame.
         '''
 
         mu = self.get_buffer("mu")
 
-        if r_celestialObject_N is None:
-            r_celestialObject_N = torch.tensor([0., 0., 0.], device=r_BN_N.device)
-        if v_celestialObject_N is None:
-            v_celestialObject_N = torch.tensor([0., 0., 0.], device=v_BN_N.device)
-        
-        rel_position_vector = r_BN_N - r_celestialObject_N
-        rel_velocity_vector = v_BN_N - v_celestialObject_N
+        # If the position vector of the celestial object is not provided, set it to zero
+        if r_celestialObjectN_N is None:
+            r_celestialObjectN_N = torch.tensor([0., 0., 0.],
+                                                device=r_BN_N.device)
+        # If the velocity vector of the celestial object is not provided, set it to zero
+        if v_celestialObjectN_N is None:
+            v_celestialObjectN_N = torch.tensor([0., 0., 0.],
+                                                device=v_BN_N.device)
 
-        
-        rel_position_vector_magnitude = torch.linalg.norm(rel_position_vector, dim=-1)
-        rel_velocity_vector_magnitude = torch.linalg.norm(rel_velocity_vector, dim=-1)
+        # Calculate the relative position and velocity vectors
+        rel_position_vector = r_BN_N - r_celestialObjectN_N
+        rel_velocity_vector = v_BN_N - v_celestialObjectN_N
 
-        dcm_RN_1 = rel_velocity_vector / rel_velocity_vector_magnitude.unsqueeze(-1)
+        rel_position_vector_magnitude = torch.norm(rel_position_vector, dim=-1)
+        rel_velocity_vector_magnitude = torch.norm(rel_velocity_vector, dim=-1)
+
+        dcm_RN_1 = rel_velocity_vector / rel_velocity_vector_magnitude.unsqueeze(
+            -1)
 
         h = torch.cross(rel_position_vector, rel_velocity_vector, dim=-1)
-        h_magnitude = torch.linalg.norm(h, dim=-1)
-        dcm_RN_2 = h/h_magnitude.unsqueeze(-1)
+        h_magnitude = torch.norm(h, dim=-1)
+        dcm_RN_2 = h / h_magnitude.unsqueeze(-1)
         dcm_RN_0 = torch.cross(dcm_RN_1, dcm_RN_2, dim=-1)
 
         dcm_RN = torch.stack([dcm_RN_0, dcm_RN_1, dcm_RN_2], dim=-2)
 
         sigma_RN = _DCM_to_MRP(dcm_RN)
 
-        r_magnitude = rel_position_vector_magnitude
-
-        
         # Robustness check
-        if r_magnitude > 1.:
+        omega_RN_R = torch.zeros_like(sigma_RN)
+        dot_omega_RN_R = torch.zeros_like(sigma_RN)
+        if rel_position_vector_magnitude > 1.:
 
             (oe_e, oe_f) = rv2elem(mu, rel_position_vector, rel_velocity_vector)
 
-            dot_f_dot_t = h_magnitude / (r_magnitude**2)
-            ddot_f_dot_t2 = -2.0 * (rel_velocity_vector*dcm_RN_0.sum(dim=-1)) / (r_magnitude*r_magnitude) * dot_f_dot_t
+            dot_f_dot_t = h_magnitude / (rel_position_vector_magnitude**2)
+            ddot_f_dot_t2 = -2.0 * (rel_velocity_vector * dcm_RN_0.sum(dim=-1)) / (rel_position_vector_magnitude * rel_position_vector_magnitude) * dot_f_dot_t
             denom = 1 + oe_e * oe_e + 2 * oe_e * torch.cos(oe_f)
             temp = (1 + oe_e * torch.cos(oe_f)) / denom
 
             omega_RN_R_0 = torch.zeros_like(dot_f_dot_t)
             omega_RN_R_1 = torch.zeros_like(dot_f_dot_t)
             omega_RN_R_2 = dot_f_dot_t * temp
-            omega_RN_R = torch.stack([omega_RN_R_0, omega_RN_R_1, omega_RN_R_2], dim=-1)
+            omega_RN_R = torch.stack(
+                [omega_RN_R_0, omega_RN_R_1, omega_RN_R_2], dim=-1)
 
             dot_omega_RN_R_0 = torch.zeros_like(ddot_f_dot_t2)
             dot_omega_RN_R_1 = torch.zeros_like(ddot_f_dot_t2)
-            dot_omega_RN_R_2 = ddot_f_dot_t2 * temp - dot_f_dot_t*dot_f_dot_t * oe_e * (oe_e*oe_e - 1) * torch.sin(oe_f) / (denom * denom)
-            dot_omega_RN_R = torch.stack([dot_omega_RN_R_0, dot_omega_RN_R_1, dot_omega_RN_R_2], dim=-1) 
+            dot_omega_RN_R_2 = ddot_f_dot_t2 * temp - dot_f_dot_t * dot_f_dot_t * oe_e * (
+                oe_e * oe_e - 1) * torch.sin(oe_f) / (denom * denom)
+            dot_omega_RN_R = torch.stack(
+                [dot_omega_RN_R_0, dot_omega_RN_R_1, dot_omega_RN_R_2], dim=-1)
         else:
-            
-            ref_shape = rel_position_vector.shape  # (batch, number, 3)
-            dot_f_dot_t = torch.zeros(ref_shape[:-1] + (1,), device=rel_position_vector.device, dtype=rel_position_vector.dtype)
-            ddot_f_dot_t2 = torch.zeros_like(dot_f_dot_t).unsqueeze(-1)
 
+            ref_shape = rel_position_vector.shape
+            dot_f_dot_t = torch.zeros(ref_shape[:-1] + (1, ),
+                                      device=rel_position_vector.device,
+                                      dtype=rel_position_vector.dtype)
+            ddot_f_dot_t2 = torch.zeros_like(dot_f_dot_t).unsqueeze(-1)
 
         dcm_NR = dcm_RN.transpose(-1, -2)
 
         omega_RN_N = torch.matmul(dcm_NR, omega_RN_R.unsqueeze(-1)).squeeze(-1)
-        dot_omega_RN_N = torch.matmul(dcm_NR, dot_omega_RN_R.unsqueeze(-1)).squeeze(-1)
-        
+        dot_omega_RN_N = torch.matmul(dcm_NR,
+                                      dot_omega_RN_R.unsqueeze(-1)).squeeze(-1)
 
-        return state_dict, (sigma_RN, omega_RN_N, dot_omega_RN_N)
+        return VelocityPointStateDict(), (sigma_RN, omega_RN_N, dot_omega_RN_N)
 
 
 
 def _DCM_to_MRP(dcm: torch.Tensor) -> torch.Tensor:
     """
-    Convert a direction cosine matrix to a MRP vector. 支持批量输入。
-    输入:
-        dcm: shape (..., 3, 3)
-    输出:
-        mrp: shape (..., 3)
+    Convert a direction cosine matrix to a MRP (Modified Rodrigues Parameters) vector.
+    Supports batch input.
+
+    Input:
+    dcm: tensor with shape (..., 3, 3)
+
+    Output:
+    mrp: tensor with shape (..., 3)
     """
-    # 先转四元数（Euler Parameters），保证第一个分量非负
-    b = _DCM_to_EulerParameters(dcm)  # (..., 4)
-    # 防止分母为零
+
+    b = _DCM_to_EulerParameters(dcm)
+
     mrp_0 = b[..., 1]/(1+b[..., 0])
     mrp_1 = b[..., 2]/(1+b[..., 0])
     mrp_2 = b[..., 3]/(1+b[..., 0])
@@ -140,22 +144,23 @@ def _DCM_to_MRP(dcm: torch.Tensor) -> torch.Tensor:
 
 def _DCM_to_EulerParameters(C: torch.Tensor) -> torch.Tensor:
     """
-    支持批量的DCM转四元数（Euler Parameters），第一个分量非负。
-    输入:
+    Convert a direction cosine matrix (DCM) to Euler Parameters (quaternion) with batched support.
+    Ensures the first component is non-negative
+    Input:
         C: shape (..., 3, 3)
-    输出:
+    Output:
         b: shape (..., 4)
     """
     tr = C[..., 0, 0] + C[..., 1, 1] + C[..., 2, 2]
 
-    # 先分别计算四个分量，最后用torch.stack拼接，避免原位操作导致梯度丢失
+
     b2_0 = (1 + tr) / 4.
     b2_1 = (1 + 2 * C[..., 0, 0] - tr) / 4.
     b2_2 = (1 + 2 * C[..., 1, 1] - tr) / 4.
     b2_3 = (1 + 2 * C[..., 2, 2] - tr) / 4.
     b2 = torch.stack([b2_0, b2_1, b2_2, b2_3], dim=-1)
 
-    # 找到最大分量的索引
+    # Find the index of the maximum component
     i = torch.argmax(b2, dim=-1)
     #b = torch.empty(C.shape[:-2] + (4,), dtype=C.dtype, device=C.device)
 
@@ -201,6 +206,8 @@ def _DCM_to_EulerParameters(C: torch.Tensor) -> torch.Tensor:
         b_2 = (C[..., 1, 2] + C[..., 2, 1]) / (4 * b_3)
         b = torch.stack([b_0, b_1, b_2, b_3], dim=-1)
         return b
+    else:
+        raise ValueError("Invalid index for DCM to Euler Parameters conversion.")
 
 
 def rv2elem(mu: torch.Tensor, r_vector: torch.Tensor, v_vector: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -308,5 +315,3 @@ def rv2elem(mu: torch.Tensor, r_vector: torch.Tensor, v_vector: torch.Tensor) ->
         f += 2 * torch.pi
 
     return (e_magnitude, f)
-
-
