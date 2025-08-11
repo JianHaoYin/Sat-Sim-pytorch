@@ -1,40 +1,416 @@
+__all__ = [
+    'Spacecraft',
+    'SpacecraftStateDict',
+    'SpacecraftStateOutput',
+    'DynamicParamsDict',
+]
+from collections import namedtuple
+from copy import deepcopy
 from typing import TypedDict
 
 import torch
 
-from satsim.architecture import Module
+from satsim.architecture import Module, Timer
+from satsim.utils.matrix_support import to_rotation_matrix
 
-from ..base import BackSubMatrices
+from ..base import BackSubMatrices, MassProps
+from ..gravity import GravityField
+from ..reaction_wheels import ReactionWheels, ReactionWheelsStateDict
+from .hub_effector import HubEffector, HubEffectorStateDict
+
+SpacecraftStateOutput = namedtuple('SpacecraftStateOutput', [
+    'position_in_inerital',
+    'velocity_in_inertial',
+    'sigma',
+    'omega',
+    'omega_dot',
+    'total_accumulated_non_gravitational_velocity_change_in_body',
+    'total_accumulated_non_gravitational_velocity_change_in_inertial',
+    'non_conservative_acceleration_of_body_in_body',
+])
 
 
 class SpacecraftStateDict(TypedDict):
-    dvAccum_CN_B: torch.Tensor
-    dvAccum_BN_B: torch.Tensor
-    dvAccum_CN_N: torch.Tensor
+    ## Running created
+    mass_props: MassProps
+    accumulated_non_gravitational_velocity_change_in_body: torch.Tensor
+    accumulated_non_gravitational_velocity_change_in_inertial: torch.Tensor
+
+    ## childmodules
+    _hub: HubEffectorStateDict
+    _reaction_wheels: ReactionWheelsStateDict
 
 
-class Spacecraft(Module[SpacecraftStateDict]):
+DynamicParamsDict = dict[str, dict[str, torch.Tensor]]
+
+
+# MRPSwitchCount deserted
+class Spacecraft(
+        Module[SpacecraftStateDict], ):
 
     def __init__(
         self,
         *args,
-        dvAccum_CN_B: torch.Tensor | None = None,
-        dvAccum_BN_B: torch.Tensor | None = None,
-        dvAccum_CN_N: torch.Tensor | None = None,
+        timer: Timer,
+        mass: torch.Tensor,
+        moment_of_inertia_matrix_wrt_body_point: torch.Tensor,
+        position: torch.Tensor,
+        velocity: torch.Tensor,
+        attitude: torch.Tensor | None = None,
+        angular_velocity: torch.Tensor | None = None,
+        gravity_field: GravityField,
+        reaction_wheels: ReactionWheels | None = None,
         **kwargs,
     ) -> None:
-        super().__init__(*args, **kwargs)
-        self.dvAccum_CN_B = dvAccum_CN_B or torch.zeros(3)
-        self.dvAccum_BN_B = dvAccum_BN_B or torch.zeros(3)
-        self.dvAccum_CN_N = dvAccum_CN_N or torch.zeros(3)
+        super().__init__(*args, timer=timer, **kwargs)
 
-    def reset(self) -> None:
-        return dict(
-            total_orbital_energy=torch.zeros(1),
-            total_rotation_energy=torch.zeros(1),
-            state_effector_rotation_energy=torch.zeros(1),
-            state_effector_orbital_energy=torch.zeros(1),
-            dvAccum_CN_B=self.dvAccum_CN_B,
-            dvAccum_BN_B=self.dvAccum_BN_B,
-            dvAccum_CN_N=self.dvAccum_CN_N,
+        self._hub = HubEffector(
+            timer=timer,
+            mass=mass,
+            moment_of_inertia_matrix_wrt_body_point=
+            moment_of_inertia_matrix_wrt_body_point,
+            position=position,
+            velocity=velocity,
+            attitude=attitude,
+            angular_velocity=angular_velocity,
         )
+        self._gravity_field = gravity_field
+        self._reaction_wheels = reaction_wheels
+
+    @property
+    def gravity_field(self) -> GravityField:
+        return self._gravity_field
+
+    @property
+    def reaction_wheels(self) -> ReactionWheels:
+        return self._reaction_wheels
+
+    def reset(self) -> SpacecraftStateDict:
+        state_dict = super().reset()
+        state_dict = self.update_spacecraft_mass_props(
+            state_dict,
+            0. * self._timer.dt,
+        )
+        state_dict.update(
+            accumulated_non_gravitational_velocity_change_in_body=torch.zeros(
+                3),
+            accumulated_non_gravitational_velocity_change_in_inertial=torch.
+            zeros(3),
+        )
+
+        return state_dict
+
+    def update_spacecraft_mass_props(
+        self,
+        state_dict: SpacecraftStateDict,
+        integrate_time_step: float,
+    ) -> SpacecraftStateDict:
+        """ The mass of spacecraft can be potentially changed due to fuel consumption or other reasons. 
+        But now there is no such feature implemented. This method is left for future use.
+        This method updates the mass properties of the spacecraft by summing up the mass properties of the
+        hub and all state effectors.
+        """
+        mass = torch.tensor(0.)
+        moment_of_inertia_matrix_wrt_body_point = torch.tensor(0.)
+
+        if self._reaction_wheels is not None:
+            reaction_wheels_state_dict = state_dict['_reaction_wheels']
+            spacecraft_mass_props = self._reaction_wheels.update_effector_mass(
+                state_dict=reaction_wheels_state_dict,
+                integrate_time_step=integrate_time_step,
+            )
+            mass = mass + spacecraft_mass_props['mass']
+            moment_of_inertia_matrix_wrt_body_point = moment_of_inertia_matrix_wrt_body_point + spacecraft_mass_props[
+                'moment_of_inertia_matrix_wrt_body_point']
+
+        mass = mass + self._hub.mass
+        moment_of_inertia_matrix_wrt_body_point = (
+            moment_of_inertia_matrix_wrt_body_point +
+            self._hub.moment_of_inertia_matrix_wrt_body_point)
+
+        state_dict['mass_props'] = MassProps(
+            mass=mass,
+            moment_of_inertia_matrix_wrt_body_point=
+            moment_of_inertia_matrix_wrt_body_point,
+        )
+        return state_dict
+
+    def equation_of_motion(
+        self,
+        state_dict: SpacecraftStateDict,
+        integrate_time_step: float,
+    ) -> DynamicParamsDict:
+        state_dict = self.update_spacecraft_mass_props(
+            state_dict,
+            integrate_time_step=integrate_time_step,
+        )
+        mass = state_dict['mass_props']['mass']
+        moment_of_inertia_matrix_wrt_body_point = state_dict['mass_props'][
+            'moment_of_inertia_matrix_wrt_body_point']
+
+        hub_state_dict = state_dict['_hub']
+        position = hub_state_dict['dynamic_params']['position']
+        angular_velocity = hub_state_dict['dynamic_params']['angular_velocity']
+
+        gravity_acceleration: torch.Tensor
+        _, (gravity_acceleration, ) = self._gravity_field(position, )
+
+        # calculate back substitution matrices
+        back_substitution_contribution = BackSubMatrices(
+            moment_of_inertia_matrix=torch.zeros_like(
+                moment_of_inertia_matrix_wrt_body_point),
+            ext_force=torch.zeros_like(position),
+            ext_torque=torch.zeros_like(position),
+        )
+
+        # Update back substitution matrices for state effectors
+        # Update reactionwheels
+        if self._reaction_wheels is not None:
+            reaction_wheels_state_dict = state_dict['_reaction_wheels']
+            back_substitution_contribution = self._reaction_wheels.update_back_substitution_contribution(
+                state_dict=reaction_wheels_state_dict,
+                back_substitution_contribution=back_substitution_contribution,
+                angular_velocity_BN_B=angular_velocity,
+            )
+
+        # update back substitution matrices for hub
+        back_substitution_contribution['moment_of_inertia_matrtix'] = (
+            back_substitution_contribution['moment_of_inertia_matrtix'] +
+            moment_of_inertia_matrix_wrt_body_point)
+        back_substitution_contribution['ext_torque'] = (
+            back_substitution_contribution['ext_torque'] + torch.cross(
+                torch.matmul(
+                    moment_of_inertia_matrix_wrt_body_point,
+                    angular_velocity.unsqueeze(-1),
+                ).squeeze(-1),
+                angular_velocity,
+                dim=-1,
+            ))
+
+        # We now exclude gravitational force as ext_force, but add it in
+        # velocity's derivative in the end in  compute_derivatives method
+        # gravity_force_in_inertial = gravity_acceleration * mass
+        # gravity_force_in_body = torch.matmul(
+        #     direction_cosine_matrix_body_to_inertial.transpose(-1, -2),
+        #     gravity_force_in_inertial.unsqueeze(-1),
+        # ).squeeze(-1)
+        # back_substitution_contribution['ext_force'] = back_substitution_contribution['ext_force'] + \
+        #     gravity_force_in_body
+
+        hub_state_dot = self._hub.compute_derivatives(
+            state_dict=hub_state_dict,
+            integrate_time_step=integrate_time_step,
+            back_substitution_matrices=back_substitution_contribution,
+            gravity_acceleration=gravity_acceleration,
+            spacecraft_mass=mass,
+        )
+
+        states_dot = dict(_hub=hub_state_dot)
+        if self._reaction_wheels is not None:
+            reaction_wheels_state_dict = state_dict['_reaction_wheels']
+            reaction_wheels_state_dot = self._reaction_wheels.compute_derivatives(
+                state_dict=reaction_wheels_state_dict,
+                angular_velocity_dot=hub_state_dot['angular_velocity'],
+            )
+            states_dot['_reaction_wheels'] = reaction_wheels_state_dot
+
+        return states_dot
+
+    def get_dynamic_params(
+        self,
+        state_dict: SpacecraftStateDict,
+    ) -> DynamicParamsDict:
+        dynamic_params = dict()
+
+        hub_state_dict = state_dict['_hub']
+        dynamic_params['_hub'] = hub_state_dict['dynamic_params']
+
+        if self._reaction_wheels is not None:
+            reaction_wheels_state_dict = state_dict['_reaction_wheels']
+            dynamic_params['_reaction_wheels'] = (
+                reaction_wheels_state_dict['dynamic_params'])
+
+        return dynamic_params
+
+    def apply_dynamic_params(
+        self,
+        state_dict: SpacecraftStateDict,
+        dynamic_params: DynamicParamsDict,
+    ) -> SpacecraftStateDict:
+        hub_state = dynamic_params['_hub']
+        state_dict['_hub']['dynamic_params'] = hub_state
+
+        if self._reaction_wheels is not None:
+            state = dynamic_params['_reaction_wheels']
+            state_dict['_reaction_wheels']['dynamic_params'] = state
+
+        return state_dict
+
+    def integrate_to_this_time(
+        self,
+        state_dict: SpacecraftStateDict,
+    ) -> SpacecraftStateDict:
+        """ Using 4 stage rungekutta method to solve the next state of the 
+        spacecraft. Originally, this method need to determine some matrix of coeificient, but here we just use a specified set of values for simplification. 
+        Additionally, in future, we can define a new differential
+        equation solver class to make it possible for user to write their own
+        differential equation solver. 
+        """
+
+        # get dynamic params space and save current dynamic params state
+        dynamic_params = self.get_dynamic_params(state_dict)
+        previous_dynamic_params = deepcopy(dynamic_params)
+
+        # stage 1
+        k1 = self.equation_of_motion(
+            state_dict=state_dict,
+            integrate_time_step=-1. * self._timer.dt,
+        )
+
+        # stage 2
+        for module_name, module_dynamic_params in dynamic_params.items():
+            module_dynamic_params_dot = k1[module_name]
+            module_previous_dynamic_state = previous_dynamic_params[
+                module_name]
+            for state_name in module_dynamic_params.keys():
+                module_dynamic_params[state_name] = \
+                    module_previous_dynamic_state[state_name] + \
+                    0.5 * self._timer.dt * \
+                    module_dynamic_params_dot[state_name]
+        state_dict = self.apply_dynamic_params(state_dict, dynamic_params)
+        k2 = self.equation_of_motion(
+            state_dict=state_dict,
+            integrate_time_step=-0.5 * self._timer.dt,
+        )
+
+        # state 3
+        for module_name, module_dynamic_params in dynamic_params.items():
+            module_dynamic_params_dot = k2[module_name]
+            module_previous_dynamic_state = previous_dynamic_params[
+                module_name]
+            for state_name in module_dynamic_params.keys():
+                module_dynamic_params[state_name] = \
+                    module_previous_dynamic_state[state_name] + \
+                    0.5 * self._timer.dt * \
+                    module_dynamic_params_dot[state_name]
+        state_dict = self.apply_dynamic_params(state_dict, dynamic_params)
+        k3 = self.equation_of_motion(
+            state_dict=state_dict,
+            integrate_time_step=-0.5 * self._timer.dt,
+        )
+
+        # stage 4
+        for module_name, module_dynamic_params in dynamic_params.items():
+            module_dynamic_params_dot = k3[module_name]
+            module_previous_dynamic_state = previous_dynamic_params[
+                module_name]
+            for state_name in module_dynamic_params.keys():
+                module_dynamic_params[state_name] = \
+                    module_previous_dynamic_state[state_name] + \
+                    1 * self._timer.dt * \
+                    module_dynamic_params_dot[state_name]
+        state_dict = self.apply_dynamic_params(state_dict, dynamic_params)
+        k4 = self.equation_of_motion(
+            state_dict=state_dict,
+            integrate_time_step=0. * self._timer.dt,
+        )
+
+        # now we can calculate the next state
+        for module_name, module_dynamic_params in dynamic_params.items():
+            module_state_dot_k1 = k1[module_name]
+            module_state_dot_k2 = k2[module_name]
+            module_state_dot_k3 = k3[module_name]
+            module_state_dot_k4 = k4[module_name]
+            module_previous_dynamic_state = previous_dynamic_params[
+                module_name]
+
+            for state_name in module_dynamic_params.keys():
+                module_dynamic_params[state_name] = module_previous_dynamic_state[state_name] + \
+                    1/6 * self._timer.dt * module_state_dot_k1[state_name] + \
+                    1/3 * self._timer.dt * module_state_dot_k2[state_name] + \
+                    1/3 * self._timer.dt * module_state_dot_k3[state_name] + \
+                    1/6 * self._timer.dt * module_state_dot_k4[state_name]
+        state_dict = self.apply_dynamic_params(state_dict, dynamic_params)
+
+        return state_dict
+
+    def forward(
+        self,
+        state_dict: SpacecraftStateDict,
+        *args,
+        **kwargs,
+    ) -> tuple[SpacecraftStateDict, tuple[SpacecraftStateOutput]]:
+        ## pre-solution
+
+        hub_state_dict = state_dict['_hub']
+        hub_state_dict = self._hub.match_gravity_to_velocity_state(
+            hub_state_dict)
+        state_dict['_hub'] = hub_state_dict
+        angular_velocity_before = hub_state_dict['dynamic_params'][
+            'angular_velocity'].clone()
+
+        ## solve next state
+        state_dict = self.integrate_to_this_time(state_dict=state_dict)
+
+        ## post-solution
+        state_dict = self.update_spacecraft_mass_props(
+            state_dict,
+            integrate_time_step=0. * self._timer.dt,
+        )
+        velocity = state_dict['_hub']['dynamic_params']['velocity']
+        sigma = state_dict['_hub']['dynamic_params']['attitude']
+        direction_cosine_matrix_body_to_inertial = to_rotation_matrix(sigma)
+        gravitational_velocity = state_dict['_hub']['dynamic_params'][
+            'grav_velocity']
+        state_dict[
+            'accumulated_non_gravitational_velocity_change_in_body'] = state_dict[
+                'accumulated_non_gravitational_velocity_change_in_body'] + torch.matmul(
+                    direction_cosine_matrix_body_to_inertial.transpose(-1, -2),
+                    (velocity - gravitational_velocity).unsqueeze(-1),
+                ).squeeze(-1)
+        state_dict['accumulated_non_gravitational_velocity_change_in_inertial'] = state_dict[
+            'accumulated_non_gravitational_velocity_change_in_inertial'] + \
+                (velocity - gravitational_velocity)
+
+        non_conservative_acceleration_of_body_in_body = torch.matmul(
+            direction_cosine_matrix_body_to_inertial.transpose(-1, -2),
+            (velocity - gravitational_velocity).unsqueeze(-1),
+        ).squeeze(-1) / self._timer.dt
+
+        angular_velocity = state_dict['_hub']['dynamic_params'][
+            'angular_velocity']
+        angular_velocity_dot = (angular_velocity -
+                                angular_velocity_before) / self._timer.dt
+
+        hub_state_dict = state_dict['_hub']
+        hub_state_dict = self._hub.modify_states(
+            state_dict=hub_state_dict,
+            integrate_time_step=0. * self._timer.dt,
+        )
+        state_dict['_hub'] = hub_state_dict
+
+        # NOTE: Here originally calculate ext_force_torque on spacecraft.
+
+        # prepare output
+        position = state_dict['_hub']['dynamic_params']['position']
+        velocity = state_dict['_hub']['dynamic_params']['velocity']
+        position_in_ineritial, velocity_in_inertial = self._gravity_field.update_inertial_position_and_velocity(
+            position,
+            velocity,
+        )
+
+        return state_dict, (SpacecraftStateOutput(
+            position_in_inerital=position_in_ineritial,
+            velocity_in_inertial=velocity_in_inertial,
+            sigma=sigma,
+            omega=angular_velocity,
+            omega_dot=angular_velocity_dot,
+            total_accumulated_non_gravitational_velocity_change_in_body=
+            state_dict[
+                'accumulated_non_gravitational_velocity_change_in_body'],
+            total_accumulated_non_gravitational_velocity_change_in_inertial=
+            state_dict[
+                'accumulated_non_gravitational_velocity_change_in_inertial'],
+            non_conservative_acceleration_of_body_in_body=
+            non_conservative_acceleration_of_body_in_body,
+        ), )

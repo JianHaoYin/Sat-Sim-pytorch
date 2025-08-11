@@ -1,45 +1,55 @@
-__all__ == ['ReactionWheelMotorTorqueStateDict', 'ReactionWheelMotorTorque']
-from typing import TypedDict
-
+__all__ = ['ReactionWheelMotorTorqueStateDict', 'ReactionWheelMotorTorque']
 import torch
 
-from satsim.architecture import Module
+from satsim.architecture import Module, VoidStateDict
 
 
-class ReactionWheelMotorTorqueStateDict(TypedDict):
-    control_axis: torch.Tensor
+class ReactionWheelMotorTorque(Module[VoidStateDict]):
 
+    def __init__(
+        self,
+        *args,
+        control_axis: torch.Tensor,
+        **kwargs,
+    ):
+        self.register_buffer(
+            '_control_axis',
+            control_axis,
+            persistent=False,
+        )
 
-class ReactionWheelMotorTorque(Module[ReactionWheelMotorTorqueStateDict]):
-
-    def reset(self):
-        return dict(control_axis=torch.zeros(3, 3), )
+    @property
+    def control_axis(self) -> torch.Tensor:
+        #[3, num_axis]
+        return self.get_buffer('_control_axis')
 
     def forward(
         self,
-        state_dict: ReactionWheelMotorTorqueStateDict,
         *args,
-        torque_request_body: torch.Tensor,
-        gsHat_B: torch.Tensor,
+        torque_request_body: torch.Tensor,  # [3]
+        reaction_wheel_spin_axis_in_body: torch.Tensor,
         **kwargs,
-    ) -> tuple[ReactionWheelMotorTorqueStateDict, tuple[torch.Tensor]]:
-        control_axis = state_dict['control_axis']
-        num_axis = control_axis.size(-1)
-        num_reaction_wheels = gsHat_B.size(-1)
+    ) -> tuple[VoidStateDict, tuple[torch.Tensor]]:
+        num_axis = self.control_axis.size(-1)
+        num_reaction_wheels = reaction_wheel_spin_axis_in_body.size(-1)
+        assert num_reaction_wheels == num_axis <= 3
 
-        torque_request_body = -torque_request_body
+        torque_request_body = -torque_request_body  # [3]
 
-        torque_axis = torch.zeros(3, device=gsHat_B.device)
-        torque_axis[:num_axis] = torque_request_body @ control_axis
-        CGs = torch.zeros(3, num_reaction_wheels, gsHat_B.device)
-        CGs[:num_axis, :num_reaction_wheels] = control_axis.t() @ gsHat_B
+        torque_axis = torch.matmul(
+            torque_request_body.unsqueeze(-2),
+            self.control_axis,
+        ).squeeze(-2)  # [num_axis]
+        CGs = torch.matmul(
+            self.control_axis.transpose(-1, -2),
+            reaction_wheel_spin_axis_in_body,
+        )  # [num_axis, num_reaction_wheels]
 
-        assert gsHat_B.size(-1) >= control_axis.size(-1)
+        # TODO: gradiant may be broken here
+        m33 = torch.matmul(CGs, CGs.transpose(-1, -2))  # [num_axis, num_axis]
+        temp = torch.linalg.solve(m33, torque_axis.unsqueeze(-1)).transpose(
+            -1, -2)  # [1, num_axis]
 
-        m33 = torch.eye(num_axis, num_axis, device=gsHat_B.device)
-        m33[:num_axis, :num_axis] = CGs @ CGs.t()
-        temp = m33.t() @ torque_axis
+        motor_torque = torch.matmul(temp, CGs).squeeze(-2)
 
-        motor_torque = temp @ CGs
-
-        return state_dict, (motor_torque, )
+        return dict(), (motor_torque, )

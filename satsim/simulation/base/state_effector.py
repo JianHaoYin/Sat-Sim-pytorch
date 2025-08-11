@@ -1,125 +1,91 @@
 __all__ = [
     'BackSubMatrices',
-    'EffectorMassProps',
-    'StateEffectorMixin',
+    'MassProps',
+    'BaseStateEffector',
     'StateEffectorStateDict',
 ]
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Any, Generic, TypeVar, TypedDict
+from typing import Generic, Mapping, TypedDict, TypeVar, cast
 
 import torch
 
+from satsim.architecture import Module
+
 
 class BackSubMatrices(TypedDict):
-    matrix_a: torch.Tensor
-    matrix_b: torch.Tensor
-    matrix_c: torch.Tensor
-    matrix_d: torch.Tensor
-    vec_trans: torch.Tensor
-    vec_rot: torch.Tensor
+    # Because we have simplified satellite as a mass point rather than a rigid body
+    # its equation of motion become more simple
+    moment_of_inertia_matrtix: torch.Tensor
+    ext_force: torch.Tensor
+    ext_torque: torch.Tensor
 
 
-class EffectorMassProps(TypedDict):
-    mEff: float = 0.
-    mEffDot: float = 0.
-    IEffPntB_B: torch.Tensor = torch.zeros(3, 3)
-    rEff_CB_B: torch.Tensor = torch.zeros(3)
-    rEffPrime_CB_B: torch.Tensor = torch.zeros(3)
-    IEffPrimePntB_B: torch.Tensor = torch.zeros(3, 3)
+class MassProps(TypedDict):
+    mass: torch.Tensor
+    moment_of_inertia_matrix_wrt_body_point: torch.Tensor
 
 
-class StateEffectorStateDict(TypedDict):
-    effProps: EffectorMassProps
-    stateDerivContribution: torch.Tensor
-    forceOnBody_B: torch.Tensor
-    torqueOnBodyPntB_B: torch.Tensor
-    torqueOnBodyPntC_B: torch.Tensor
-    r_BP_P: torch.Tensor
-    dcm_BP: torch.Tensor
+U = TypeVar('U', bound=Mapping[str, torch.Tensor])
 
 
-T = TypeVar('T')
+class StateEffectorStateDict(TypedDict, Generic[U]):
+    mass_props: MassProps
+    dynamic_params: U
 
 
-class StateEffectorMixin(ABC, Generic[T]):
+T = TypeVar('T', bound=StateEffectorStateDict)
 
-    def state_effector_reset(self) -> StateEffectorStateDict:
-        effProps = dict(
-            mEff=0.,
-            mEffDot=0.,
-            IEffPntB_B=torch.zeros(3, 3),
-            rEff_CB_B=torch.zeros(3),
-            rEffPrime_CB_B=torch.zeros(3),
-            IEffPrimePntB_B=torch.zeros(3, 3),
+
+class BaseStateEffector(Module[T], ABC):
+
+    def reset(self) -> T:
+        state_dict = super().reset()
+        mass_props = dict(
+            mass=torch.zeros(1),
+            moment_of_inertia_matrix_wrt_body_point=torch.zeros(3, 3),
         )
-        return dict(
-            effProps=effProps,
-            stateDerivContribution=torch.Tensor(
-            ),  #Supposed to be a x-dimension tensor
-            forceOnBody_B=torch.zeros(3),
-            torqueOnBodyPntB_B=torch.zeros(3),
-            torqueOnBodyPntC_B=torch.zeros(3),
-            r_BP_P=torch.zeros(3),
-            dcm_BP=torch.eye(3, 3),
-        )
+        state_dict.update(mass_props=mass_props)
+        return cast(T, state_dict)
 
     def update_effector_mass(
         self,
         state_dict: T,
-    ) -> T:
-        return state_dict
+        integrate_time_step: float,
+    ) -> MassProps:
+        return state_dict['mass_props']
 
     def update_back_substitution_contribution(
         self,
         state_dict: T,
-        backSubContr: BackSubMatrices,
-        sigma_BN: torch.Tensor,
-        omega_BN_B: torch.Tensor,
-        g_N: torch.Tensor,
-    ) -> tuple[T, BackSubMatrices]:
-        return state_dict, backSubContr
+        integrate_time_step: float,
+        back_substitution_contribution: BackSubMatrices,
+        *args,
+        **kwargs,
+    ) -> BackSubMatrices:
+        return back_substitution_contribution
 
-    def update_energy_momentum_contributions(
+    def modify_states(
         self,
         state_dict: T,
-        rotAngMomPntCContr_B: torch.Tensor,
-        rotEnergyContr: torch.Tensor,
-        omega_BN_B: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return rotAngMomPntCContr_B, rotEnergyContr
-
-    def modify_states(self, state_dict: T) -> T:
-        return state_dict
-
-    def calcForceTorqueOnBody(
-        self,
-        state_dict: T,
-        omega_BN_B: torch.Tensor,
+        integrate_time_step: float,
     ) -> T:
         return state_dict
 
-    def register_states(self, state_dict: T) -> T:
+    def calculate_force_torque_on_body(
+        self,
+        state_dict: T,
+        integrate_time_step: float,
+        *args,
+        **kwargs,
+    ) -> T:
         return state_dict
 
     @abstractmethod
     def compute_derivatives(
         self,
         state_dict: T,
-        rDDot_BN_N: torch.Tensor,
-        omegaDot_BN_B: torch.Tensor,
-        sigma_BN: torch.Tensor,
-    ) -> T:
+        integrate_time_step: float,
+        *args,
+        **kwargs,
+    ) -> U:
         pass
-
-    def prependSpacecraftNameToStates(self, state_dict: T) -> T:
-        return state_dict
-
-    # Temporarily left for code comprehension
-    def receiveMotherSpacecraftData(
-        self,
-        rSC_BP_P: torch.Tensor,
-        dcmSC_BP: torch.Tensor,
-    ) -> None:
-        self.r_BP_P = rSC_BP_P
-        self.dcm_BP = dcmSC_BP
