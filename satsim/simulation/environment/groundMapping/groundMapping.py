@@ -3,7 +3,7 @@ __all__ = ["GroundMapping", "GroundMappingStateDict", "GroundStateDict","AccessD
 from typing import TypedDict
 import torch
 from satsim.architecture import Module
-
+from satsim.utils.matrix_support import to_rotation_matrix
 
 class GroundMappingStateDict(TypedDict):
     pass
@@ -21,7 +21,7 @@ class AccessDict(TypedDict):
     azimuth_Angle: torch.Tensor # [rad] Azimuth angle for a spacecraft.
     range_dot: torch.Tensor # [m/s] Range rate of a given spacecraft relative to a location in the SEZ rotating frame.
     elevation_dot: torch.Tensor # [rad/s] Elevation angle rate for a given spacecraft in the SEZ rotating frame.
-    az_dot: torch.Tensor # [rad/s] Azimuth angle rate for a given spacecraft in the SEZ rotating frame.
+    azimuth_Angle_dot: torch.Tensor # [rad/s] Azimuth angle rate for a given spacecraft in the SEZ rotating frame.
     r_BL_L: torch.Tensor # [m] Spacecraft position relative to the groundLocation in the SEZ frame.
     v_BL_L: torch.Tensor # [m/s] SEZ relative time derivative of r_BL vector in SEZ vector components.
 
@@ -107,14 +107,14 @@ class GroundMapping(Module[GroundMappingStateDict]):
 
     def forward(
         self,
-        state_dict: GroundMappingStateDict | None,
-        planet_Position_in_inertial: torch.Tensor | None,
-        dcm_inertial_to_PlanetFix: torch.Tensor | None,
-        dcm_inertial_to_PlanetFix_dot: torch.Tensor | None,
-        r_BN_N: torch.Tensor = None,
+        state_dict: GroundMappingStateDict | None = None,
+        planet_Position_in_inertial: torch.Tensor | None = None,
+        dcm_inertial_to_PlanetFix: torch.Tensor | None = None,
+        dcm_inertial_to_PlanetFix_dot: torch.Tensor | None = None,
+        r_BN_N: torch.Tensor | None = None,
         v_BN_N: torch.Tensor | None = None,
         sigma_BN: torch.Tensor | None = None,
-        mapping_Points: list[torch.Tensor] | None = None,
+        mapping_Points: list[torch.Tensor] | None = None, #list of mapping points in the inertial frame
         *args,
         **kwargs,
     ) -> tuple[GroundMappingStateDict | None, list[AccessDict], list[GroundStateDict]]:
@@ -141,7 +141,6 @@ class GroundMapping(Module[GroundMappingStateDict]):
         currentGroundState: list[GroundStateDict] = []
 
 
-        
         #initialize the v_BN_N vector
         if v_BN_N is not None:
             v_BN_N = v_BN_N
@@ -153,24 +152,22 @@ class GroundMapping(Module[GroundMappingStateDict]):
         if dcm_inertial_to_PlanetFix is not None:
             dcm_PN = dcm_inertial_to_PlanetFix
         else:
-
             dcm_PN = torch.eye(3, device=r_BN_N.device, dtype=r_BN_N.dtype)
-            #dcm_PN = torch.eye(3, device=r_BN_N.device, dtype=r_BN_N.dtype)[None, None, :, :].expand(B, N, 3, 3)
-        
+
         if dcm_inertial_to_PlanetFix_dot is not None:
             dcm_PN_dot = dcm_inertial_to_PlanetFix_dot
         else:
             dcm_PN_dot = torch.zeros_like(dcm_PN)
-
 
         if planet_Position_in_inertial is not None:
             r_PN_N = planet_Position_in_inertial
         else:
             r_PN_N = torch.zeros_like(r_BN_N)
 
+
         r_BP_N = r_BN_N - r_PN_N
 
-        dcm_BN = _mrp_to_dcm(sigma_BN)
+        dcm_BN = to_rotation_matrix(sigma_BN)
         
         dcm_NB = dcm_BN.transpose(-2, -1)
         # Get planet frame angular velocity vector
@@ -187,7 +184,6 @@ class GroundMapping(Module[GroundMappingStateDict]):
             rhat_LP_N = r_LP_N / torch.linalg.norm(r_LP_N, dim=-1, keepdim=True)
             r_LN_N = r_PN_N + r_LP_N
 
-
             currentGroundState.append(
                 GroundStateDict(
                     r_LN_N=r_LN_N,
@@ -197,14 +193,11 @@ class GroundMapping(Module[GroundMappingStateDict]):
 
             r_BL_N = r_BP_N - r_LP_N
             r_BL_mag = torch.linalg.norm(r_BL_N, dim=-1, keepdim=True)
-            relativeHeading_N = r_BL_N / r_BL_mag
-            # print("r_BL_mag", r_BL_mag)
-            # print("relativeHeading_N", relativeHeading_N)
-
-            viewAngle = (torch.pi/2 - torch.acos(torch.clamp((relativeHeading_N*rhat_LP_N).sum(dim=-1), -1, 1)))
+            relative_Heading_N = r_BL_N / r_BL_mag
+            viewAngle = (torch.pi/2 - torch.acos(torch.clamp((relative_Heading_N*rhat_LP_N).sum(dim=-1), -1, 1)))
 
 
-            # Compute the dcm_LP from r_LP_N and dcm_J2000_to_PlanetFix
+            # Compute dcm_LP from r_LP_N and dcm_inertial_to_PlanetFix
             dcm_LP = compute_dcm_LP_from_r_LP_N(
                 r_LP_N=r_LP_N,
                 dcm_inertial_to_PlanetFix=dcm_inertial_to_PlanetFix
@@ -213,7 +206,7 @@ class GroundMapping(Module[GroundMappingStateDict]):
             ### Compute the items that are needed for the access dictionary
             r_BL_L = torch.matmul(
                 torch.matmul(dcm_LP, dcm_PN),
-                r_BL_N)
+                r_BL_N.unsqueeze(-1)).squeeze(-1)
             
             #azimuth shape:[...,1]
             azimuth = torch.atan2(
@@ -223,7 +216,7 @@ class GroundMapping(Module[GroundMappingStateDict]):
 
             v_BL_L=torch.matmul(
                 torch.matmul(dcm_LP, dcm_PN),
-                v_BN_N - torch.cross(w_PN, r_BP_N, dim=-1))
+                v_BN_N - torch.cross(w_PN, r_BP_N, dim=-1).unsqueeze(-1)).squeeze(-1)
             
             range_dot = (v_BL_L*r_BL_L).sum(dim=-1) / r_BL_mag
 
@@ -231,10 +224,8 @@ class GroundMapping(Module[GroundMappingStateDict]):
             az_dot = (-r_BL_L[..., 0] * v_BL_L[..., 1] + r_BL_L[..., 1] * v_BL_L[..., 0]) / (xy_norm**2)
             el_dot = (v_BL_L[..., 2]/xy_norm - r_BL_L[..., 2]*(r_BL_L[..., 0]*v_BL_L[..., 0] + r_BL_L[..., 1]*v_BL_L[..., 1])/xy_norm**3) / (1+(r_BL_L[..., 2]/xy_norm)**2)
 
+            within_view = _check_Instrument_FieldOfVision(r_LP_N, r_BP_N, dcm_NB, camera_Pos_B, nHat_B, maximum_Range, halfField_Of_View)
 
-
-            within_view = _check_Instrument_FieldOfVision(r_LP_N,r_BP_N,dcm_NB,camera_Pos_B,nHat_B,maximum_Range,halfField_Of_View)
-            #用getbuffer把self的变量取出来
             if (viewAngle > minimum_Elevation  and within_view):
                 has_Access = True
             else:
@@ -248,8 +239,8 @@ class GroundMapping(Module[GroundMappingStateDict]):
                     azimuth = azimuth,                    
                     v_BL_L = v_BL_L,
                     range_dot = range_dot,
-                    az_dot = az_dot,
-                    el_dot = el_dot, 
+                    azimuth_Angle_dot = az_dot,
+                    elevation_dot = el_dot, 
                     has_Access = has_Access,                                         
                 )
             )
@@ -259,52 +250,26 @@ class GroundMapping(Module[GroundMappingStateDict]):
     
 
 
-def _mrp_to_dcm(sigma: torch.Tensor) -> torch.Tensor:
-
-    q1, q2, q3 = sigma
-    q2_sum = sigma @ sigma
-    S = 1 - q2_sum
-    d = (1 + q2_sum) ** 2
-
-    c00 = 4 * (2 * q1 * q1 - q2_sum) + S * S
-    c01 = 8 * q1 * q2 + 4 * q3 * S
-    c02 = 8 * q1 * q3 - 4 * q2 * S
-    c10 = 8 * q2 * q1 - 4 * q3 * S
-    c11 = 4 * (2 * q2 * q2 - q2_sum) + S * S
-    c12 = 8 * q2 * q3 + 4 * q1 * S
-    c20 = 8 * q3 * q1 + 4 * q2 * S
-    c21 = 8 * q3 * q2 - 4 * q1 * S
-    c22 = 4 * (2 * q3 * q3 - q2_sum) + S * S
-
-    C = torch.stack([
-        torch.stack([c00, c01, c02]),
-        torch.stack([c10, c11, c12]),
-        torch.stack([c20, c21, c22])
-    ])
-
-    return C / d
-
 def _check_Instrument_FieldOfVision(r_LP_N : torch.Tensor,
                         r_BP_N : torch.Tensor,
                         dcm_NB : torch.Tensor,
                         cameraPos_B: torch.Tensor,
                         nHat_B: torch.Tensor,
                         maximum_Range: float,
-                        halfFieldOfView: float) -> bool:
+                        half_FieldOfView: float) -> bool:
     
     #源代码中列向量乘行向量 出来的boresightNormalProj是个标量
-    #
-    boresightNormalProj_mul_1 = (r_LP_N - (r_BP_N + torch.matmul(dcm_NB, cameraPos_B.unsqueeze(-1)).squeeze(-1)))
-    boresightNormalProj_mul_2 = torch.matmul(dcm_NB, nHat_B.unsqueeze(-1)).squeeze(-1)
-    boresightNormalProj =  (boresightNormalProj_mul_1*boresightNormalProj_mul_2).sum(dim=-1)
+    boresight_Normal_Proj_mul_1 = (r_LP_N - (r_BP_N + torch.matmul(dcm_NB, cameraPos_B.unsqueeze(-1)).squeeze(-1)))
+    boresight_Normal_Proj_mul_2 = torch.matmul(dcm_NB, nHat_B.unsqueeze(-1)).squeeze(-1)
+    boresight_Normal_Proj =  (boresight_Normal_Proj_mul_1*boresight_Normal_Proj_mul_2).sum(dim=-1)
 
-    if (boresightNormalProj >= 0) and (boresightNormalProj <= maximum_Range or maximum_Range < 0):
-        coneRadius = boresightNormalProj * torch.tan(halfFieldOfView)
+    if (boresight_Normal_Proj >= 0) and (boresight_Normal_Proj <= maximum_Range or maximum_Range < 0):
+        coneRadius = boresight_Normal_Proj * torch.tan(half_FieldOfView)
 
         orthDistance_cal_1 = r_LP_N - (r_BP_N + torch.matmul(dcm_NB, cameraPos_B.unsqueeze(-1)).squeeze(-1))
         orthDistance_cal_2 = torch.matmul(
-                                boresightNormalProj*dcm_NB,
-                                nHat_B)
+                                boresight_Normal_Proj*dcm_NB,
+                                nHat_B.unsqueeze(-1)).squeeze(-1)
         orthDistance = torch.linalg.norm(orthDistance_cal_1 - orthDistance_cal_2, dim=-1)
 
         if orthDistance <= coneRadius:

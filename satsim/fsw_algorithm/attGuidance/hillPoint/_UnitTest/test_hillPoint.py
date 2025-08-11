@@ -33,9 +33,9 @@ def test_HillPoint(celMsgSet):
     f_dot = np.sqrt(mu/(a*a*a))
 
 
-    expected_sigma_RN = torch.tensor([[[0., 0., 0.267949192431]]],dtype=torch.float32)
-    expected_omega_RN_N = torch.tensor([[[0.0, 0.0, f_dot]]],dtype=torch.float32)
-    expected_dot_omega_RN_N = torch.tensor([[[0.0, 0.0, 1.315647475046e-23]]])
+    expected_sigma_RN = torch.tensor([[[0., 0., 0.267949192431]]], dtype=torch.float32)
+    expected_omega_RN_N = torch.tensor([[[0.0, 0.0, f_dot]]], dtype=torch.float32)
+    expected_dot_omega_RN_N = torch.tensor([[[0.0, 0.0, 1.315647475046e-23]]], dtype=torch.float32)
 
     assert torch.allclose(sigma_RN, expected_sigma_RN, atol=1e-12)
     assert torch.allclose(omega_RN_N, expected_omega_RN_N, atol=1e-12)
@@ -66,7 +66,6 @@ def HillPointTestFunction(celMsgSet):
 
 
     state_dict, (sigma_RN, omega_RN_N, dot_omega_RN_N) = module.forward(
-
         r_BN_N=r_BN_N,
         v_BN_N=v_BN_N,
         r_celestialObjectN_N=planetPos,

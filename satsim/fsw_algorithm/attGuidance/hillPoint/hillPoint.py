@@ -60,20 +60,10 @@ class HillPoint(Module[HillPointStateDict]):
         sigma_RN = _DCM_to_MRP(dcm_RN)
 
         r_magnitude = torch.norm(rel_position_vector, dim=-1)
-
-
-        # if r_magnitude > 1.:
-        #     dot_f_dot_t = h_magnitude / (r_magnitude**2)
-        #     ddot_f_dot_t2 = -2.0 * (rel_velocity_vector*dcm_RN_0).sum(dim=-1) / r_magnitude * dot_f_dot_t
-        # else:
-        #     ref_shape = rel_position_vector.shape
-        #     dot_f_dot_t = torch.zeros(ref_shape[:-1] + (1,), device=rel_position_vector.device, dtype=rel_position_vector.dtype)
-        #     ddot_f_dot_t2 = torch.zeros_like(dot_f_dot_t)
-            
         
         # find the shape of the rel_position_vector
-        ref_shape = rel_position_vector.shape  # e.g., [batch_size, 3]
-        batch_shape = ref_shape[:-1]           # e.g., [batch_size]
+        ref_shape = rel_position_vector.shape
+        batch_shape = ref_shape[:-1]  
 
         # Create a mask to identify elements where the magnitude of the relative position vector is greater than 1.0
         mask = r_magnitude > 1.0
@@ -82,10 +72,9 @@ class HillPoint(Module[HillPointStateDict]):
         dot_f_dot_t_all = h_magnitude / (r_magnitude ** 2)
 
         # Broadcast processing of rel_velocity_vector * dcm_RN_0
-        rel_velocity_proj = (rel_velocity_vector * dcm_RN_0).sum(dim=-1)  # shape: [...], 与 r_magnitude 一致
+        rel_velocity_proj = (rel_velocity_vector * dcm_RN_0).sum(dim=-1)
         ddot_f_dot_t2_all = -2.0 * rel_velocity_proj / r_magnitude * dot_f_dot_t_all
 
-        # Construct a zero tensor (value used for else branch)
         zeros = torch.zeros(batch_shape + (1,), device=rel_position_vector.device, dtype=rel_position_vector.dtype)
 
         # Use torch.where to select results element by element (and keep the last dimension)

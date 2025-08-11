@@ -54,12 +54,10 @@ class VelocityPoint(Module[VelocityPointStateDict]):
 
         # If the position vector of the celestial object is not provided, set it to zero
         if r_celestialObjectN_N is None:
-            r_celestialObjectN_N = torch.tensor([0., 0., 0.],
-                                                device=r_BN_N.device)
+            r_celestialObjectN_N = torch.tensor([0., 0., 0.], device=r_BN_N.device)
         # If the velocity vector of the celestial object is not provided, set it to zero
         if v_celestialObjectN_N is None:
-            v_celestialObjectN_N = torch.tensor([0., 0., 0.],
-                                                device=v_BN_N.device)
+            v_celestialObjectN_N = torch.tensor([0., 0., 0.], device=v_BN_N.device)
 
         # Calculate the relative position and velocity vectors
         rel_position_vector = r_BN_N - r_celestialObjectN_N
@@ -68,8 +66,7 @@ class VelocityPoint(Module[VelocityPointStateDict]):
         rel_position_vector_magnitude = torch.norm(rel_position_vector, dim=-1)
         rel_velocity_vector_magnitude = torch.norm(rel_velocity_vector, dim=-1)
 
-        dcm_RN_1 = rel_velocity_vector / rel_velocity_vector_magnitude.unsqueeze(
-            -1)
+        dcm_RN_1 = rel_velocity_vector / rel_velocity_vector_magnitude.unsqueeze(-1)
 
         h = torch.cross(rel_position_vector, rel_velocity_vector, dim=-1)
         h_magnitude = torch.norm(h, dim=-1)
@@ -80,43 +77,66 @@ class VelocityPoint(Module[VelocityPointStateDict]):
 
         sigma_RN = _DCM_to_MRP(dcm_RN)
 
-        # Robustness check
+
         omega_RN_R = torch.zeros_like(sigma_RN)
         dot_omega_RN_R = torch.zeros_like(sigma_RN)
-        if rel_position_vector_magnitude > 1.:
+        
+        #### Robustness check ####
+        mask = (rel_position_vector_magnitude > 1.0)  # shape: [batch]
+        mask_expanded = mask.unsqueeze(-1)            # shape: [batch, 1]
 
-            (oe_e, oe_f) = rv2elem(mu, rel_position_vector, rel_velocity_vector)
+        # Get the shape of the relative position vector
+        ref_shape = rel_position_vector.shape
+        batch_shape = ref_shape[:-1]
 
-            dot_f_dot_t = h_magnitude / (rel_position_vector_magnitude**2)
-            ddot_f_dot_t2 = -2.0 * (rel_velocity_vector * dcm_RN_0.sum(dim=-1)) / (rel_position_vector_magnitude * rel_position_vector_magnitude) * dot_f_dot_t
-            denom = 1 + oe_e * oe_e + 2 * oe_e * torch.cos(oe_f)
-            temp = (1 + oe_e * torch.cos(oe_f)) / denom
+        # === Branch 1: r > 1.0 ===
+        (oe_e, oe_f) = rv2elem(mu, rel_position_vector, rel_velocity_vector)
 
-            omega_RN_R_0 = torch.zeros_like(dot_f_dot_t)
-            omega_RN_R_1 = torch.zeros_like(dot_f_dot_t)
-            omega_RN_R_2 = dot_f_dot_t * temp
-            omega_RN_R = torch.stack(
-                [omega_RN_R_0, omega_RN_R_1, omega_RN_R_2], dim=-1)
+        dot_f_dot_t_1 = h_magnitude / (rel_position_vector_magnitude ** 2)
+        ddot_f_dot_t2_1 = -2.0 * (rel_velocity_vector * dcm_RN_0.sum(dim=-1).unsqueeze(-1)) \
+                            / (rel_position_vector_magnitude ** 2).unsqueeze(-1) * dot_f_dot_t_1.unsqueeze(-1)
 
-            dot_omega_RN_R_0 = torch.zeros_like(ddot_f_dot_t2)
-            dot_omega_RN_R_1 = torch.zeros_like(ddot_f_dot_t2)
-            dot_omega_RN_R_2 = ddot_f_dot_t2 * temp - dot_f_dot_t * dot_f_dot_t * oe_e * (
-                oe_e * oe_e - 1) * torch.sin(oe_f) / (denom * denom)
-            dot_omega_RN_R = torch.stack(
-                [dot_omega_RN_R_0, dot_omega_RN_R_1, dot_omega_RN_R_2], dim=-1)
-        else:
+        denom = 1 + oe_e**2 + 2 * oe_e * torch.cos(oe_f)
+        temp = (1 + oe_e * torch.cos(oe_f)) / denom
 
-            ref_shape = rel_position_vector.shape
-            dot_f_dot_t = torch.zeros(ref_shape[:-1] + (1, ),
-                                      device=rel_position_vector.device,
-                                      dtype=rel_position_vector.dtype)
-            ddot_f_dot_t2 = torch.zeros_like(dot_f_dot_t).unsqueeze(-1)
+        omega_RN_R_2 = dot_f_dot_t_1 * temp  # shape: [batch]
+        omega_RN_R_2 = omega_RN_R_2.unsqueeze(-1)  # shape: [batch, 1]
+        
+        omega_RN_R = torch.stack([
+            torch.zeros_like(omega_RN_R_2),                  # omega_RN_R_0
+            torch.zeros_like(omega_RN_R_2),                  # omega_RN_R_1
+            omega_RN_R_2                                     # omega_RN_R_2
+        ], dim=-1)
+
+        term2 = ddot_f_dot_t2_1.squeeze(-1) * temp \
+                - dot_f_dot_t_1 ** 2 * oe_e * (oe_e**2 - 1) * torch.sin(oe_f) / (denom ** 2)
+        dot_omega_RN_R_2 = term2.unsqueeze(-1)
+        dot_omega_RN_R = torch.stack([
+            torch.zeros_like(dot_omega_RN_R_2),
+            torch.zeros_like(dot_omega_RN_R_2),
+            dot_omega_RN_R_2
+        ], dim=-1)  # shape: [batch, 3]
+
+        # === Branch 2: r <= 1.0 ===
+        zeros_scalar = torch.zeros(batch_shape + (1,), device=rel_position_vector.device, dtype=rel_position_vector.dtype)
+        zeros_vec = torch.zeros(batch_shape + (3,), device=rel_position_vector.device, dtype=rel_position_vector.dtype)
+
+        dot_f_dot_t_2 = zeros_scalar
+        ddot_f_dot_t2_2 = zeros_scalar
+        omega_RN_R_2 = zeros_vec
+        dot_omega_RN_R_2 = zeros_vec
+
+        # === Use torch.where to combine results ===
+        dot_f_dot_t = torch.where(mask_expanded, dot_f_dot_t_1.unsqueeze(-1), dot_f_dot_t_2)
+        ddot_f_dot_t2 = torch.where(mask_expanded, ddot_f_dot_t2_1, ddot_f_dot_t2_2)
+        omega_RN_R = torch.where(mask_expanded.expand_as(omega_RN_R), omega_RN_R, zeros_vec)
+        dot_omega_RN_R = torch.where(mask_expanded.expand_as(dot_omega_RN_R), dot_omega_RN_R, zeros_vec)
+
+
 
         dcm_NR = dcm_RN.transpose(-1, -2)
-
         omega_RN_N = torch.matmul(dcm_NR, omega_RN_R.unsqueeze(-1)).squeeze(-1)
-        dot_omega_RN_N = torch.matmul(dcm_NR,
-                                      dot_omega_RN_R.unsqueeze(-1)).squeeze(-1)
+        dot_omega_RN_N = torch.matmul(dcm_NR, dot_omega_RN_R.unsqueeze(-1)).squeeze(-1)
 
         return VelocityPointStateDict(), (sigma_RN, omega_RN_N, dot_omega_RN_N)
 

@@ -8,9 +8,7 @@ import torch
 from satsim.architecture import Timer
 from satsim.simulation.environment.groundMapping import (
     GroundMapping,
-    GroundMappingStateDict,
-    GroundStateDict,
-    AccessDict,
+
 )
 
 import pytest
@@ -33,15 +31,12 @@ def test_groundMapping(maxRange):
 
     expected_hasaccess = torch.tensor([True, False])
     accessDict_hasaccess = torch.tensor(
-        [accessDict[0]["hasAccess"],
-         accessDict[1]["hasAccess"]
+        [accessDict[0]["has_Access"],
+         accessDict[1]["has_Access"]
         ],dtype=torch.bool)
     assert torch.equal(accessDict_hasaccess, expected_hasaccess)
     return accessDict,currentGroundState
 
-
-
-    #assert testResults < 1, testMessage
 
 
 def groundMappingTestFunction(maxRange):
@@ -51,86 +46,43 @@ def groundMappingTestFunction(maxRange):
     unitTaskName = "unitTask"
     unitProcessName = "TestProcess"
 
-    # unitTestSim = SimulationBaseClass.SimBaseClass()
-    # testProcessRate = macros.sec2nano(0.5)
-    # testProc = unitTestSim.CreateNewProcess(unitProcessName)
-    # testProc.addTask(unitTestSim.CreateNewTask(unitTaskName, testProcessRate))
-
-    # Configure blank module input messages
 
     J20002Pfix = torch.tensor([[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]])
     PositionVector = torch.tensor([0., 0., 0.])
-
-
 
     r_BN_N = torch.tensor([0., -1., 0.])
     sigma_BN = torch.tensor([0., 0., 0.])
     v_BN_N = torch.tensor([0., 0., 0.])
 
     # Create the initial imaging target
-    groundMap = GroundMapping(maximumRange=torch.tensor(maxRange))
+    groundMap = GroundMapping(maximum_Range=torch.tensor(maxRange))
 
-    groundMap.addPointToModel(torch.tensor([0., -0.1, 0.]))
-    groundMap.addPointToModel(torch.tensor([0., 0., math.tan(np.radians(22.5))+0.1]))
-    groundMap.minimumElevation = torch.tensor(np.radians(45.))
+    mapping_Points = [torch.tensor([0., -0.1, 0.]), torch.tensor([0., 0., math.tan(np.radians(22.5))+0.1])]
 
-    groundMap.cameraPos_B = torch.tensor([0., 0., 0.])
+    groundMap.minimum_Elevation = torch.tensor(np.radians(45.))
+
+    groundMap.camera_Pos_B = torch.tensor([0., 0., 0.])
     groundMap.nHat_B = torch.tensor([0., 1., 0.])
-    groundMap.halfFieldOfView = torch.tensor(np.radians(22.5))
+    groundMap.halfField_Of_View = torch.tensor(np.radians(22.5))
 
 
-    # # Setup the logging for the mapping locations
-    # mapLog = []
-    # for idx in range(0, 2):
-    #     mapLog.append(groundMap.accessOutMsgs[idx].recorder())
-    #     unitTestSim.AddModelToTask(unitTaskName, mapLog[idx])
-
-    # # subscribe input messages to module
-    # groundMap.planetInMsg.subscribeTo(planetInMsg)
-    # groundMap.scStateInMsg.subscribeTo(scStateInMsg)
-
-    # # setup output message recorder objects
-    # unitTestSim.InitializeSimulation()
-    # unitTestSim.ConfigureStopTime(macros.sec2nano(1.0))
-    # unitTestSim.ExecuteSimulation()
-
-    # # pull module data and make sure it is correct
-    # map_access = np.zeros(2, dtype=bool)
-    # for idx in range(0, 2):
-    #     access = mapLog[idx].hasAccess
-    #     if sum(access):
-    #         map_access[idx] = 1
-
-    # # If the first target is not mapped, failure
-    # if not map_access[0] and (maxRange > 1.0 or maxRange < 0.0) :
-    #     testFailCount += 1
-
-    # # If the second target is mapped, failure
-    # if map_access[1]:
-    #     testFailCount += 1
-
-    # if testFailCount == 0:
-    #     print("PASSED: " + groundMap.ModelTag)
-    # else:
-    #     print(testMessages)
-
-    # return [testFailCount, "".join(testMessages)]
     state_dict, (accessDict,currentGroundState) = groundMap.forward(
         None,
-        J20002Pfix=J20002Pfix,
-        PositionVector=PositionVector,
+        dcm_inertial_to_PlanetFix=J20002Pfix,
+        planet_Position_in_inertial=PositionVector,
         r_BN_N=r_BN_N,
         v_BN_N=v_BN_N,
-        sigma_BN=sigma_BN
+        sigma_BN=sigma_BN,
+        mapping_Points=mapping_Points
     )
 
     return state_dict, (accessDict,currentGroundState)
 
 
 if __name__ == "__main__":
-    accessDict,currentGroundState = test_groundMapping(1e9)
+    #accessDict,currentGroundState = test_groundMapping(1e9)
     #accessDict,currentGroundState = test_groundMapping(0.001)
     #accessDict,currentGroundState = test_groundMapping(1e-12)
     #accessDict,currentGroundState = test_groundMapping(2.0)
     #accessDict,currentGroundState = test_groundMapping(-1.0)
-    #raise RuntimeError("This test does not support direct run")
+    raise RuntimeError("This test does not support direct run")
