@@ -46,14 +46,6 @@ class GravityBody(Module[VoidStateDict], ABC):
     def set_central(self):
         self._is_central = True
 
-
-    def forward(
-        state_dict: VoidStateDict,
-        *args,
-        **kwargs,
-    ) -> Never:
-        raise NotImplementedError
-
     @abstractmethod
     def compute_gravitational_acceleration(
         self,
@@ -96,7 +88,7 @@ class PointMassGravityBody(GravityBody):
     def compute_gravitational_acceleration(
         self,
         relative_position: Tensor,
-    ) -> tuple[VoidStateDict, tuple[Tensor]]:
+    ) -> Tensor:
         """
         Computes the gravitational field for a set of point masses at specified positions.
 

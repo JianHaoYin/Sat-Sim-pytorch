@@ -4,9 +4,9 @@ __all__ = [
     'SpacecraftStateOutput',
     'DynamicParamsDict',
 ]
-from collections import namedtuple
 from copy import deepcopy
-from typing import TypedDict
+from time import sleep
+from typing import NamedTuple, NotRequired, TypedDict
 
 import torch
 
@@ -18,16 +18,16 @@ from ..gravity import GravityField
 from ..reaction_wheels import ReactionWheels, ReactionWheelsStateDict
 from .hub_effector import HubEffector, HubEffectorStateDict
 
-SpacecraftStateOutput = namedtuple('SpacecraftStateOutput', [
-    'position_in_inerital',
-    'velocity_in_inertial',
-    'sigma',
-    'omega',
-    'omega_dot',
-    'total_accumulated_non_gravitational_velocity_change_in_body',
-    'total_accumulated_non_gravitational_velocity_change_in_inertial',
-    'non_conservative_acceleration_of_body_in_body',
-])
+
+class SpacecraftStateOutput(NamedTuple):
+    position_in_inertial: torch.Tensor
+    velocity_in_inertial: torch.Tensor
+    attitude: torch.Tensor
+    angular_velocity: torch.Tensor
+    angular_velocity_dot: torch.Tensor
+    total_accumulated_non_gravitational_velocity_change_in_body: torch.Tensor
+    total_accumulated_non_gravitational_velocity_change_in_inertial: torch.Tensor
+    non_conservative_acceleration_of_body_in_body: torch.Tensor
 
 
 class SpacecraftStateDict(TypedDict):
@@ -38,7 +38,7 @@ class SpacecraftStateDict(TypedDict):
 
     ## childmodules
     _hub: HubEffectorStateDict
-    _reaction_wheels: ReactionWheelsStateDict
+    _reaction_wheels: NotRequired[ReactionWheelsStateDict]
 
 
 DynamicParamsDict = dict[str, dict[str, torch.Tensor]]
@@ -82,7 +82,7 @@ class Spacecraft(
         return self._gravity_field
 
     @property
-    def reaction_wheels(self) -> ReactionWheels:
+    def reaction_wheels(self) -> ReactionWheels | None:
         return self._reaction_wheels
 
     def reset(self) -> SpacecraftStateDict:
@@ -174,8 +174,8 @@ class Spacecraft(
             )
 
         # update back substitution matrices for hub
-        back_substitution_contribution['moment_of_inertia_matrtix'] = (
-            back_substitution_contribution['moment_of_inertia_matrtix'] +
+        back_substitution_contribution['moment_of_inertia_matrix'] = (
+            back_substitution_contribution['moment_of_inertia_matrix'] +
             moment_of_inertia_matrix_wrt_body_point)
         back_substitution_contribution['ext_torque'] = (
             back_substitution_contribution['ext_torque'] + torch.cross(
@@ -210,6 +210,7 @@ class Spacecraft(
             reaction_wheels_state_dict = state_dict['_reaction_wheels']
             reaction_wheels_state_dot = self._reaction_wheels.compute_derivatives(
                 state_dict=reaction_wheels_state_dict,
+                integrate_time_step=integrate_time_step,
                 angular_velocity_dot=hub_state_dot['angular_velocity'],
             )
             states_dot['_reaction_wheels'] = reaction_wheels_state_dot
@@ -339,7 +340,7 @@ class Spacecraft(
         state_dict: SpacecraftStateDict,
         *args,
         **kwargs,
-    ) -> tuple[SpacecraftStateDict, tuple[SpacecraftStateOutput]]:
+    ) -> tuple[SpacecraftStateDict, SpacecraftStateOutput]:
         ## pre-solution
 
         hub_state_dict = state_dict['_hub']
@@ -358,8 +359,8 @@ class Spacecraft(
             integrate_time_step=0. * self._timer.dt,
         )
         velocity = state_dict['_hub']['dynamic_params']['velocity']
-        sigma = state_dict['_hub']['dynamic_params']['attitude']
-        direction_cosine_matrix_body_to_inertial = to_rotation_matrix(sigma)
+        attitude = state_dict['_hub']['dynamic_params']['attitude']
+        direction_cosine_matrix_body_to_inertial = to_rotation_matrix(attitude)
         gravitational_velocity = state_dict['_hub']['dynamic_params'][
             'grav_velocity']
         state_dict[
@@ -394,17 +395,17 @@ class Spacecraft(
         # prepare output
         position = state_dict['_hub']['dynamic_params']['position']
         velocity = state_dict['_hub']['dynamic_params']['velocity']
-        position_in_ineritial, velocity_in_inertial = self._gravity_field.update_inertial_position_and_velocity(
+        position_in_inertial, velocity_in_inertial = self._gravity_field.update_inertial_position_and_velocity(
             position,
             velocity,
         )
 
-        return state_dict, (SpacecraftStateOutput(
-            position_in_inerital=position_in_ineritial,
+        return state_dict, SpacecraftStateOutput(
+            position_in_inertial=position_in_inertial,
             velocity_in_inertial=velocity_in_inertial,
-            sigma=sigma,
-            omega=angular_velocity,
-            omega_dot=angular_velocity_dot,
+            attitude=attitude,
+            angular_velocity=angular_velocity,
+            angular_velocity_dot=angular_velocity_dot,
             total_accumulated_non_gravitational_velocity_change_in_body=
             state_dict[
                 'accumulated_non_gravitational_velocity_change_in_body'],
@@ -413,4 +414,4 @@ class Spacecraft(
                 'accumulated_non_gravitational_velocity_change_in_inertial'],
             non_conservative_acceleration_of_body_in_body=
             non_conservative_acceleration_of_body_in_body,
-        ), )
+        )
