@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 import csv
 import math
 from typing import Never,Self
-
+from satsim.architecture.timer import Timer
 import torch
 from torch import Tensor
 
@@ -21,8 +21,6 @@ class GravityBody(Module[VoidStateDict], ABC):
         equatorial_radius: float,
         polar_radius: float | None = None,
         is_central: bool = False,
-        gravity_file: str | None = None,
-        max_degree: int | None = None,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -43,8 +41,17 @@ class GravityBody(Module[VoidStateDict], ABC):
     def is_central(self) -> bool:
         return self._is_central
 
+
     def set_central(self):
         self._is_central = True
+
+    def forward(
+        self,
+        state_dict: VoidStateDict,
+        *args,
+        **kwargs,
+    ) -> Never:
+        raise NotImplementedError
 
     @abstractmethod
     def compute_gravitational_acceleration(
@@ -65,8 +72,9 @@ class GravityBody(Module[VoidStateDict], ABC):
         pass
 
     @classmethod
-    def create_sun(cls, **kwargs) -> Self:
+    def create_sun(cls, timer, **kwargs) -> Self:
         return cls(
+            timer = timer,
             name='SUN',
             gm=constants.MU_SUN * 1e9,
             equatorial_radius=constants.REQ_SUN,
@@ -74,8 +82,9 @@ class GravityBody(Module[VoidStateDict], ABC):
         )
 
     @classmethod
-    def create_earth(cls, **kwargs) -> Self:
+    def create_earth(cls, timer, **kwargs) -> Self:
         return cls(
+            timer = timer,
             name='EARTH',
             gm=constants.MU_EARTH * 1e9,
             equatorial_radius=constants.REQ_EARTH,
@@ -121,12 +130,14 @@ class SphericalHarmonicGravityBody(GravityBody):
     def __init__(
         self,
         *args,
+        gravity_file = '/supportData/LocalGravData/GGM03S-J2-only.txt',
+        max_degree = 2,
         **kwargs,
+
     ) -> None:
         
         super().__init__(*args, **kwargs)
-        gravity_file = kwargs.get('gravity_file', '/supportData/LocalGravData/GGM03S-J2-only.txt')
-        max_degree = kwargs.get('max_degree', 2)
+
         self.loadGravFromFile(gravity_file, maxDeg=max_degree)
         self.initializeParameters()
 
@@ -160,42 +171,8 @@ class SphericalHarmonicGravityBody(GravityBody):
         nQuot1 = []
         nQuot2 = []
 
-        #torch.diag_embed
-        
-        # # init the basic parameters
-        # # calculate aBar / n1 / n2
-        # for i in range(self.maxDeg + 2):
-        #     aRow = [0.0] * (i + 1)
-        #     if i == 0:
-        #         aRow[i] = 1.0
-        #     else:
-        #         aRow[i] = math.sqrt(((2 * i + 1) * getK(i)) / (2 * i * getK(i - 1))) * aBar[i - 1][i - 1]
-        #     n1Row = [0.0] * (i + 1)
-        #     n2Row = [0.0] * (i + 1)
-        #     for m in range(i + 1):
-        #         if i >= m + 2:
-        #             n1Row[m] = math.sqrt(((2 * i + 1) * (2 * i - 1)) / ((i - m) * (i + m)))
-        #             n2Row[m] = math.sqrt(((i + m - 1) * (2 * i + 1) * (i - m - 1)) /
-        #                                 ((i + m) * (i - m) * (2 * i - 3)))
-        #     n1.append(n1Row)
-        #     n2.append(n2Row)
-        #     aBar.append(aRow)
-
-        # # calculate nQuot1 / nQuot2
-        # for l in range(self.maxDeg + 1):
-        #     nq1Row = [0.0] * (l + 1)
-        #     nq2Row = [0.0] * (l + 1)
-        #     for m in range(l + 1):
-        #         if m < l:
-        #             nq1Row[m] = math.sqrt(((l - m) * getK(m) * (l + m + 1)) / getK(m + 1))
-        #         nq2Row[m] = math.sqrt(((l + m + 2) * (l + m + 1) * (2 * l + 1) * getK(m)) /
-        #                             ((2 * l + 3) * getK(m + 1)))
-        #     nQuot1.append(nq1Row)
-        #     nQuot2.append(nq2Row)
-
         #init the basic parameters
         # calculate aBar / n1 / n2
-
         for i in range(self.maxDeg + 2):
             aRow = [0.0] * (self.maxDeg + 2)
             if i == 0:
@@ -232,7 +209,7 @@ class SphericalHarmonicGravityBody(GravityBody):
         self.nQuot1 = nQuot1
         self.nQuot2 = nQuot2
 
-
+    #@line_profiler.profile
     def compute_gravitational_acceleration(
             self, 
             relative_position: Tensor,
@@ -276,34 +253,70 @@ class SphericalHarmonicGravityBody(GravityBody):
         #compute gravity field
         degree = self.maxDeg
         include_zero_degree = True
+        order = degree
 
         x = relative_position[..., 0].unsqueeze(-1)
         y = relative_position[..., 1].unsqueeze(-1)
         z = relative_position[..., 2].unsqueeze(-1)
-
-        # x = relative_position[..., 0]
-        # y = relative_position[..., 1]
-        # z = relative_position[..., 2]
 
         r = torch.norm(relative_position, dim=-1, keepdim=True)
         s = x / r #shape (...,1)
         t = y / r #shape (...,1)
         u = z / r #shape (...,1)
 
-        # aBar_t = torch.tensor(self.aBar, dtype=dtype, device=device)
-        # n1_t = torch.tensor(self.n1, dtype=dtype, device=device)
-        # n2_t = torch.tensor(self.n2, dtype=dtype, device=device)
-
         aBar_t = expand_matrix(self.aBar, relative_position, dtype=dtype, device=device)
         n1_t   = expand_matrix(self.n1, relative_position, dtype=dtype, device=device)
         n2_t   = expand_matrix(self.n2, relative_position, dtype=dtype, device=device)
         
-        order = degree
+        ### Original implementation of initializing aBar_t ###
+        # # Calcute the coefficients aBar_t
+        # for l in range(1, degree+2):
+        #     aBar_t[..., l, l-1] = (math.sqrt((2*l*getK(l-1))/getK(l)) * aBar_t[..., l, l].unsqueeze(-1) * u).squeeze(-1)  # shape (..., degree+2, degree+2)
+
+        # for m in range(order + 2):
+        #     for l in range(m + 2, degree + 2):
+
+        #         aBar_t[..., l, m] = (u * n1_t[..., l, m].unsqueeze(-1) * aBar_t[..., l-1, m].unsqueeze(-1) - n2_t[..., l, m].unsqueeze(-1) * aBar_t[..., l-2, m].unsqueeze(-1)).squeeze(-1)  # shape (..., degree+2, degree+2)
 
 
-        # Diagonal terms are computed in initialized
-        for l in range(1, degree+2):
-            aBar_t[..., l, l-1] = (math.sqrt((2*l*getK(l-1))/getK(l)) * aBar_t[..., l, l].unsqueeze(-1) * u).squeeze(-1)  # shape (..., degree+2, degree+2)
+        # # Calcute the coefficients aBar_t
+        #  (l, l-1) terms
+        l_idx = torch.arange(1, degree + 2, device=aBar_t.device)                # [1,2,...,degree+1]
+        # coef(l) = 1 (l==1) else sqrt(2*l)
+        coef = torch.where(
+            l_idx == 1,
+            torch.ones_like(l_idx, dtype=u.dtype),
+            torch.sqrt(2.0 * l_idx.to(u.dtype))
+        )
+        # aBar_t[..., l, l-1] = coef * aBar_t[..., l, l] * u
+        aBar_t[..., l_idx, l_idx - 1] = coef * aBar_t[..., l_idx, l_idx] * u
+
+
+        m_all = torch.arange(order + 2, device=aBar_t.device)
+
+        for l in range(2, degree + 2):                     # need l-2，start from 2
+            # m: 0..(l-2)
+            limit = min(l - 1, order + 2)                  # l-2 是上界（含），长度为 l-1
+            if limit <= 0:
+                continue
+            vm = m_all[:limit]                             # shape (<=order+2,)
+
+            # a_{l,m} = u * n1_{l,m} * a_{l-1,m} - n2_{l,m} * a_{l-2,m}
+            aBar_t[..., l, vm] = (
+                u * n1_t[..., l, vm] * aBar_t[..., l - 1, vm]
+                -     n2_t[..., l, vm] * aBar_t[..., l - 2, vm]
+            )
+
+
+        ### Original implementation of initializing rE and iM ###
+
+            # if m == 0:
+            #     rE[..., 0] = 1.0
+            #     iM[..., 0] = 0.0
+            # else:
+
+            #     rE[..., m] = (s * rE[..., m - 1].unsqueeze(-1) - t * iM[..., m - 1].unsqueeze(-1)).squeeze(-1)
+            #     iM[..., m] = (s * iM[..., m - 1].unsqueeze(-1) + t * rE[..., m - 1].unsqueeze(-1)).squeeze(-1)
 
         # Generate real / imaginary parts (rE, iM) of (2+j*t)^m
         # shape rE and iM are (..., 1)
@@ -313,33 +326,26 @@ class SphericalHarmonicGravityBody(GravityBody):
 
         iM = torch.zeros_like(rE)
 
-        for m in range(order + 2):
-            for l in range(m + 2, degree + 2):
+        z_st = s + 1j * t
+        m_idx = torch.arange(order+2, device=z_st.device)
+        z_pow = z_st ** m_idx                     # (..., order+2)
+        rE = z_pow.real                           # (..., order+2)
+        iM = z_pow.imag                           # (..., order+2)
 
-                aBar_t[..., l, m] = (u * n1_t[..., l, m].unsqueeze(-1) * aBar_t[..., l-1, m].unsqueeze(-1) - n2_t[..., l, m].unsqueeze(-1) * aBar_t[..., l-2, m].unsqueeze(-1)).squeeze(-1)  # shape (..., degree+2, degree+2)
-
-            if m == 0:
-                rE[..., 0] = 1.0
-                iM[..., 0] = 0.0
-            else:
-
-                rE[..., m] = (s * rE[..., m - 1].unsqueeze(-1) - t * iM[..., m - 1].unsqueeze(-1)).squeeze(-1)
-                iM[..., m] = (s * iM[..., m - 1].unsqueeze(-1) + t * rE[..., m - 1].unsqueeze(-1)).squeeze(-1)
-
-        # rho = self.radEquator / r
-        # rhol = [self.muBody / r]
-        # rhol.append(rhol[0] * rho)
-
+        # Compute the radial coefficient rhol
         rho = self.radEquator / r  # shape (..., 1)
         rhol_0 = self.muBody / r   # shape (..., 1)
 
-        rhol = torch.zeros(relative_position.shape[:-1] + (degree+2,),
-                        device=relative_position.device,
-                        dtype=relative_position.dtype)
+        ### Original implementation of initializing rhol ###
+        # rhol = torch.zeros(relative_position.shape[:-1] + (degree+2,),
+        #                 device=relative_position.device,
+        #                 dtype=relative_position.dtype)
         
-        rhol[..., 0] = rhol_0.squeeze(-1)
-        rhol[..., 1] = (rhol_0 * rho).squeeze(-1)
+        # rhol[..., 0] = rhol_0.squeeze(-1)
+        # rhol[..., 1] = (rhol_0 * rho).squeeze(-1)
 
+        powers = torch.arange(degree+2, device=rho.device, dtype=rho.dtype)
+        rhol = rhol_0 * rho.pow(powers)  # shape (..., degree+2)
 
         #Gravity components
         a1 = torch.zeros_like(r) #shape (...,1)
@@ -349,41 +355,79 @@ class SphericalHarmonicGravityBody(GravityBody):
         if include_zero_degree:
             a4[..., 0] = -rhol[..., 1] / self.radEquator
 
+
+        sum_a1 = torch.zeros_like(r) #shape (...,1)
+        sum_a2 = torch.zeros_like(r)
+        sum_a3 = torch.zeros_like(r)
+        sum_a4 = torch.zeros_like(r)
+
+        cBar_t = expand_matrix(self.cBar, relative_position, dtype=dtype, device=device)
+        sBar_t = expand_matrix(self.sBar, relative_position, dtype=dtype, device=device)
+        nQuot1_t = expand_matrix(self.nQuot1, relative_position, dtype=dtype, device=device)
+        nQuot2_t = expand_matrix(self.nQuot2, relative_position, dtype=dtype, device=device)
+
+
+
         for l in range(1, degree + 1):
-            rhol[..., l + 1] = (rho * rhol[..., l].unsqueeze(-1)).squeeze(-1)  # shape (..., degree+2)
+            #rhol[..., l + 1] = (rho * rhol[..., l].unsqueeze(-1)).squeeze(-1)  # shape (..., degree+2)
 
-            sum_a1 = torch.zeros_like(r) #shape (...,1)
-            sum_a2 = torch.zeros_like(r)
-            sum_a3 = torch.zeros_like(r)
-            sum_a4 = torch.zeros_like(r)
+            # for m in range(l + 1):
+                # D = cBar_t[..., l, m] * rE[..., m] + sBar_t[...,l,m] * iM[...,m]
+                # #D = D.unsqueeze(-1)  # shape (..., 1)
+                # if m == 0:
+                #     E = torch.zeros_like(r)  # shape (...,1)
+                #     F = torch.zeros_like(r)  # shape (...,1)
+                # else:
+                #     E = cBar_t[..., l, m] * rE[..., m - 1] + sBar_t[...,l,m] * iM[..., m - 1]
+                #     E = E.unsqueeze(-1)  # shape (..., 1)
+                #     F = sBar_t[..., l, m] * rE[..., m - 1] - cBar_t[..., l, m] * iM[..., m - 1]
+                #     F = F.unsqueeze(-1)  # shape (..., 1)
 
-            cBar_t = expand_matrix(self.cBar, relative_position, dtype=dtype, device=device)
-            sBar_t = expand_matrix(self.sBar, relative_position, dtype=dtype, device=device)
-            nQuot1_t = expand_matrix(self.nQuot1, relative_position, dtype=dtype, device=device)
-            nQuot2_t = expand_matrix(self.nQuot2, relative_position, dtype=dtype, device=device)
+                # sum_a1 += m * aBar_t[..., l, m].unsqueeze(-1) * E
+                # sum_a2 += m * aBar_t[..., l, m].unsqueeze(-1) * F
+                # if m < l:
+                #     sum_a3 += nQuot1_t[..., l, m].unsqueeze(-1) * aBar_t[..., l, m + 1].unsqueeze(-1) * D.unsqueeze(-1) #shape(...,)
+                # sum_a4 += nQuot2_t[..., l, m].unsqueeze(-1) * aBar_t[..., l + 1, m + 1].unsqueeze(-1) * D.unsqueeze(-1)
 
-            for m in range(l + 1):
-                D = cBar_t[..., l, m] * rE[..., m] + sBar_t[...,l,m] * iM[...,m]
-                #D = D.unsqueeze(-1)  # shape (..., 1)
-                if m == 0:
-                    E = torch.zeros_like(r)  # shape (...,1)
-                    F = torch.zeros_like(r)  # shape (...,1)
-                else:
-                    E = cBar_t[..., l, m] * rE[..., m - 1] + sBar_t[...,l,m] * iM[..., m - 1]
-                    E = E.unsqueeze(-1)  # shape (..., 1)
-                    F = sBar_t[..., l, m] * rE[..., m - 1] - cBar_t[..., l, m] * iM[..., m - 1]
-                    F = F.unsqueeze(-1)  # shape (..., 1)
+            # a1 += rhol[..., l + 1].unsqueeze(-1) / self.radEquator * sum_a1
+            # a2 += rhol[..., l + 1].unsqueeze(-1) / self.radEquator * sum_a2
+            # a3 += rhol[..., l + 1].unsqueeze(-1) / self.radEquator * sum_a3
+            # a4 -= rhol[..., l + 1].unsqueeze(-1) / self.radEquator * sum_a4
 
-                sum_a1 += m * aBar_t[..., l, m].unsqueeze(-1) * E
-                sum_a2 += m * aBar_t[..., l, m].unsqueeze(-1) * F
-                if m < l:
-                    sum_a3 += nQuot1_t[..., l, m].unsqueeze(-1) * aBar_t[..., l, m + 1].unsqueeze(-1) * D.unsqueeze(-1) #shape(...,)
-                sum_a4 += nQuot2_t[..., l, m].unsqueeze(-1) * aBar_t[..., l + 1, m + 1].unsqueeze(-1) * D.unsqueeze(-1)
+            M = l + 1
 
-            a1 += rhol[..., l + 1].unsqueeze(-1) / self.radEquator * sum_a1
-            a2 += rhol[..., l + 1].unsqueeze(-1) / self.radEquator * sum_a2
-            a3 += rhol[..., l + 1].unsqueeze(-1) / self.radEquator * sum_a3
-            a4 -= rhol[..., l + 1].unsqueeze(-1) / self.radEquator * sum_a4
+            cL = cBar_t[..., l, :M]        # (..., M)
+            sL = sBar_t[..., l, :M]        # (..., M)
+            rE_m = rE[..., :M]             # (..., M)
+            iM_m = iM[..., :M]             # (..., M)
+
+            D = cL * rE_m + sL * iM_m      # (..., M)
+
+            rE_prev = torch.cat([torch.zeros_like(rE_m[..., :1]), rE_m[..., :-1]], dim=-1)  # (..., M)
+            iM_prev = torch.cat([torch.zeros_like(iM_m[..., :1]), iM_m[..., :-1]], dim=-1)  # (..., M)
+
+            E = cL * rE_prev + sL * iM_prev  # (..., M)
+            F = sL * rE_prev - cL * iM_prev  # (..., M)
+
+            m_idx = torch.arange(M, device=relative_position.device, dtype=relative_position.dtype)  # (M,)
+
+            aL          = aBar_t[..., l, :M]       # (..., M)
+            aL_mplus1   = aBar_t[..., l, 1:M]      # (..., M-1)
+            aLp1_mplus1 = aBar_t[..., l+1, 1:M+1]  # (..., M)
+
+            nQ1 = nQuot1_t[..., l, :M-1]           # (..., M-1)
+            nQ2 = nQuot2_t[..., l, :M]             # (..., M)
+
+            sum_a1 = (m_idx * aL * E).sum(dim=-1, keepdim=True)                 # (...,1)
+            sum_a2 = (m_idx * aL * F).sum(dim=-1, keepdim=True)                 # (...,1)
+            sum_a3 = (nQ1 * aL_mplus1 * D[..., :M-1]).sum(dim=-1, keepdim=True) # (...,1)
+            sum_a4 = (nQ2 * aLp1_mplus1 * D).sum(dim=-1, keepdim=True)          # (...,1)
+
+            coeff = rhol[..., l + 1].unsqueeze(-1) / self.radEquator
+            a1 += coeff * sum_a1
+            a2 += coeff * sum_a2
+            a3 += coeff * sum_a3
+            a4 -= coeff * sum_a4
 
         
         ax = a1 + s * a4
@@ -400,6 +444,7 @@ class SphericalHarmonicGravityBody(GravityBody):
     
     @classmethod
     def create_sun(cls,
+                timer : Timer,
                 gravity_file : str = '/supportData/LocalGravData/GGM03S-J2-only.txt',
                 max_degree : int = 2, 
                 **kwargs) -> Self:
@@ -409,13 +454,15 @@ class SphericalHarmonicGravityBody(GravityBody):
             equatorial_radius=constants.REQ_SUN,
             gravity_file=gravity_file,
             max_degree=max_degree,
+            timer=timer,
             **kwargs,
         )
 
     @classmethod
     def create_earth(cls,
+                timer : Timer,
                 gravity_file : str = '/supportData/LocalGravData/GGM03S-J2-only.txt',
-                max_degree : int = 12, 
+                max_degree : int = 2, 
                 **kwargs) -> Self:
         return cls(
             name='EARTH',
@@ -423,6 +470,7 @@ class SphericalHarmonicGravityBody(GravityBody):
             equatorial_radius=constants.REQ_EARTH,
             gravity_file=gravity_file,
             max_degree=max_degree,
+            timer=timer,
             **kwargs,
         )
 

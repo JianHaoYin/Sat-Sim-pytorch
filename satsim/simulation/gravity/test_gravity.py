@@ -5,6 +5,7 @@ import numpy as np
 import math
 import time
 import csv
+from satsim.architecture.timer import Timer
 
 def computeGravityTo20(positionVector):
     #This code follows the formulation in Vallado, page 521, second edition and uses data from UTexas CSR for
@@ -157,18 +158,27 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 relative_position = torch.tensor([[[15000., 10000.0, 6378.1363*1e3],[15000.0, 10000.0, 6378.1363*1e3]]],device=device, dtype=dtype)  # shape (1, 2, 3)
 
+# 批量复制，生成 shape (16, 100, 3)
+batch_size = 16
+num_positions = 100
+
+# 先 repeat 原始的 2 个位置到 100
+relative_position_batch = relative_position.repeat(1, num_positions // 2, 1)  # (1, 100, 3)
+# 再 repeat batch 维度
+relative_position_batch = relative_position_batch.repeat(batch_size, 1, 1)  # (16, 100, 3)
+relative_position = relative_position_batch
 
 #gravity_file_path = '/home/d632/YJH/Sat-Sim-pytorch/supportData/LocalGravData/GGM03S-J2-only.txt'
 gravity_file_path = '/home/d632/YJH/Sat-Sim-pytorch/supportData/LocalGravData/GGM03S.txt'
 
-
-gravbody = gravity_body.SphericalHarmonicGravityBody.create_earth(gravity_file=gravity_file_path, max_degree=50)
+timer = Timer()
+gravbody = gravity_body.SphericalHarmonicGravityBody.create_earth(timer=timer,gravity_file=gravity_file_path, max_degree=20)
 gravCheck = computeGravityTo20([15000., 10000., 6378.1363E3])
 gravOut = gravbody.compute_gravitational_acceleration(relative_position)
 
 
 gravOutMag = torch.norm(gravOut, dim=-1)
-gravOutMag_0 = gravOutMag[..., 0].item()
+gravOutMag_0 = gravOutMag[..., 0]
 gravCheckMag = np.linalg.norm(gravCheck)
 
 accuracy = 1e-12
@@ -178,13 +188,31 @@ print(f'relative:{relative}')
 
 
 start = time.time()
-for i in range(1):
+for i in range(3600):
     gravOut = gravbody.compute_gravitational_acceleration(relative_position)
 end = time.time()
-print(f'time1:{end - start}')
+print(f'time_spharm:{end - start}')
 
+# start = time.time()
+# for i in range(10000):
+#     gravOut = gravbody.compute_gravitational_acceleration(relative_position)
+# end = time.time()
+# print(f'time10000:{end - start}')
+
+gravbody_pointmass = gravity_body.PointMassGravityBody.create_earth(timer=timer)
 start = time.time()
-for i in range(10000):
-    gravOut = gravbody.compute_gravitational_acceleration(relative_position)
+for i in range(3600):
+    gravOut_pointmass = gravbody_pointmass.compute_gravitational_acceleration(relative_position)
+#gravOut_pointmass = gravbody_pointmass.compute_gravitational_acceleration(relative_position)
 end = time.time()
-print(f'time10000:{end - start}')
+print(f'time_pointmass:{end - start}')
+
+
+# from line_profiler import LineProfiler
+# # 初始化分析器并指定函数
+# lp = LineProfiler()
+# lp_wrapper = lp(gravbody.compute_gravitational_acceleration(relative_position))
+# lp_wrapper()  # 运行函数
+
+# # 生成报告（或用命令行：kernprof -l -v my_script.py）
+# lp.print_stats()
